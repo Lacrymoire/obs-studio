@@ -83,9 +83,9 @@ struct shmem_data {
  * it, so it never waits for OBS and OBS never shows a slot being written.
  * Times are os_gettime_ns() values: QueryPerformanceCounter scaled to
  * nanoseconds, the clock libobs uses for obs_get_video_frame_time(). */
-#define SHTEX_LOG_VERSION 2
-#define PRESENT_LOG_SIZE 64
-#define FRAME_RING_MAX 8
+#define SHTEX_LOG_VERSION 3
+#define PRESENT_LOG_SIZE 256
+#define FRAME_RING_MAX 16
 #define FRAME_RING_NONE 0xFFFFFFFFu
 
 struct present_record {

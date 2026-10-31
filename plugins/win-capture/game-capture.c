@@ -142,6 +142,16 @@ struct game_capture_config {
 #define LOCK_HARD_GAP 3.0       /* periods; a present gap this long re-anchors the clock at once */
 #define LOCK_SETTLE 0.33        /* fraction of the period: consecutive gaps this close to it mean the clock settled */
 #define LOCK_PENDING_MAX 9      /* presents off the line kept back before the clock counts as lost */
+/* Phase 6: re-anchors this close together mean the carried period is wrong (the game's rate moved
+ * by more than the window follows): the clock is refitted from scratch instead */
+#define LOCK_REANCHOR_BURST 3
+#define LOCK_REANCHOR_BURST_NS 1000000000ULL
+/* Phase 6 cadence (see cadence_choose): m output ticks per n game frames */
+#define CADENCE_BAND 0.02      /* residual (paced tick rate / output rate - 1) a cadence may have to be chosen */
+#define CADENCE_KEEP 0.03      /* residual the current cadence may drift to before it is re-chosen */
+#define CADENCE_MAX_E 0.05     /* beyond this nothing is chosen: stock constant frame rate */
+#define CADENCE_MAX_N 64       /* longest cycle in game frames */
+#define CADENCE_CHANGE_NS 2000000000ULL /* the rate must be outside the band this long before a change */
 
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetThreadDpiAwarenessContext)(VOID);
@@ -243,6 +253,9 @@ struct game_capture {
 		uint64_t anchor_counter;
 		uint64_t last_counter;
 		uint64_t last_time_ns;
+		uint64_t last_gap_ns;    /* gap before the last record (cold start: a slow game is not a pause) */
+		uint64_t last_reanchor_ns;
+		uint32_t reanchor_burst;
 		/* presents off the fitted line, kept out of the window until the
 		 * clock settles (lock_add) */
 		uint64_t pending_counters[LOCK_PENDING_MAX];
@@ -258,8 +271,15 @@ struct game_capture {
 		/* Phase 5 game-clock output (see game_clock_tick) */
 		bool vfr;                /* engaged: the game is the slower clock */
 		bool vfr_now;            /* this tick's frame carries a game-clock stamp */
-		bool retime_refused;     /* retimed mode: the game is too slow for it (logged once) */
+		bool cad_refused;        /* no cadence within CADENCE_MAX_E for this game (logged once) */
+		bool ring_short_logged;  /* the ring cannot hold the buffer delay at this rate (logged once) */
 		uint64_t vfr_frames, vfr_paced, vfr_starved, vfr_repeats;
+		/* Phase 6 cadence (see game_clock_tick): cad_m output ticks per cad_n game frames */
+		uint32_t cad_m, cad_n;
+		double cad_e;            /* its residual: paced tick rate / output rate - 1 */
+		uint64_t cad_out_ns;     /* since when the game's rate has been outside CADENCE_KEEP (0 = within) */
+		uint64_t cad_changes;
+		uint64_t delay_ns;       /* buffer delay used this tick: the setting, or less when the ring is short */
 	} lock;
 
 	/* frame-locked capture: Phase 1 debug log state (see flog_tick) */
@@ -451,9 +471,11 @@ static void lock_reopen(struct game_capture *gc)
 	const bool ready = gc->lock.ready;
 
 	const uint64_t vfr_frames = gc->lock.vfr_frames, vfr_paced = gc->lock.vfr_paced,
-		       vfr_starved = gc->lock.vfr_starved, vfr_repeats = gc->lock.vfr_repeats;
+		       vfr_starved = gc->lock.vfr_starved, vfr_repeats = gc->lock.vfr_repeats,
+		       cad_changes = gc->lock.cad_changes;
 
 	memset(&gc->lock, 0, sizeof(gc->lock));
+	gc->lock.cad_changes = cad_changes;
 	gc->lock.vfr_frames = vfr_frames;
 	gc->lock.vfr_paced = vfr_paced;
 	gc->lock.vfr_starved = vfr_starved;
@@ -476,6 +498,8 @@ static inline void lock_window_add(struct game_capture *gc, uint64_t counter, ui
 	gc->lock.head = (gc->lock.head + 1) % LOCK_FIT_N;
 	if (gc->lock.n < LOCK_FIT_N)
 		gc->lock.n++;
+	if (gc->lock.last_time_ns && time_ns > gc->lock.last_time_ns)
+		gc->lock.last_gap_ns = time_ns - gc->lock.last_time_ns;
 	gc->lock.last_counter = counter;
 	gc->lock.last_time_ns = time_ns;
 }
@@ -497,9 +521,29 @@ static inline double lock_time_of(const struct game_capture *gc, uint64_t counte
 	return gc->lock.anchor_ns + (double)(int64_t)(counter - gc->lock.anchor_counter) * gc->lock.period_ns;
 }
 
+/* the same for a fractional position on the timeline (Phase 6 cadence ticks) */
+static inline double lock_time_of_x(const struct game_capture *gc, double x)
+{
+	return gc->lock.anchor_ns + (x - (double)(int64_t)gc->lock.anchor_counter) * gc->lock.period_ns;
+}
+
 /* the clock moved: keep its period, start the window again from this record */
 static void lock_reanchor(struct game_capture *gc, uint64_t counter, uint64_t time_ns, const char *why, bool new_space)
 {
+	/* Phase 6: re-anchors in a burst mean the carried period no longer fits
+	 * (the game's rate moved: a cutscene, a menu, an uncapped game under
+	 * load); refit from scratch so the cadence can follow */
+	if (time_ns - gc->lock.last_reanchor_ns < LOCK_REANCHOR_BURST_NS) {
+		if (++gc->lock.reanchor_burst >= LOCK_REANCHOR_BURST) {
+			gc->lock.reanchor_burst = 0;
+			gc->lock.last_reanchor_ns = time_ns;
+			lock_reset(gc, "clock drifting");
+			return;
+		}
+	} else {
+		gc->lock.reanchor_burst = 1;
+	}
+	gc->lock.last_reanchor_ns = time_ns;
 	gc->lock.reanchors++;
 	gc->lock.n = 0;
 	gc->lock.head = 0;
@@ -526,7 +570,9 @@ static void lock_add(struct game_capture *gc, uint64_t counter, uint64_t time_ns
 			lock_window_add(gc, counter, time_ns);
 			return;
 		}
-		if (gap > LOCK_MAX_TIME_GAP_NS || (double)gap >= LOCK_HARD_GAP * gc->lock.period_ns) {
+		/* a hard gap is counted in game periods (Phase 6: no fixed cap, so a
+		 * 5 fps game is not re-anchored on every frame) */
+		if ((double)gap >= LOCK_HARD_GAP * gc->lock.period_ns) {
 			lock_reanchor(gc, counter, time_ns, "long pause", false);
 			lock_window_add(gc, counter, time_ns);
 			return;
@@ -585,8 +631,8 @@ static void lock_add(struct game_capture *gc, uint64_t counter, uint64_t time_ns
 			lock_reset(gc, "counter went backwards");
 		else if (dc > LOCK_MAX_COUNTER_GAP)
 			lock_reset(gc, "presents missing");
-		else if (dt > LOCK_MAX_TIME_GAP_NS)
-			lock_reset(gc, "long pause");
+		else if (dt > LOCK_MAX_TIME_GAP_NS && dt > 3 * gc->lock.last_gap_ns)
+			lock_reset(gc, "long pause"); /* (a slow game's ordinary gap is not a pause) */
 	}
 	lock_window_add(gc, counter, time_ns);
 }
@@ -642,8 +688,26 @@ static void lock_fit(struct game_capture *gc)
  * hook may be writing the slot of the frame before it) */
 static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t newest, uint64_t oldest)
 {
-	const uint64_t delay_ns = (uint64_t)gc->config.buffer_delay * obs_get_frame_interval_ns();
-	const double target = (double)(int64_t)(tick_ns - delay_ns);
+	uint64_t delay_ns = (uint64_t)gc->config.buffer_delay * obs_get_frame_interval_ns();
+	double target;
+	/* Phase 6: the ring holds ring - 2 safe frames; at a high game rate the
+	 * delay would reach past them, so it is shortened to what the ring holds
+	 * (the video is then that much less delayed for this game) */
+	if (gc->ring.size >= 4) {
+		const double fit = (double)(gc->ring.size - 3) * gc->lock.period_ns;
+		if ((double)delay_ns > fit) {
+			delay_ns = (uint64_t)fit;
+			if (!gc->lock.ring_short_logged) {
+				gc->lock.ring_short_logged = true;
+				info("frame lock: the ring of %" PRIu32 " cannot hold the buffer delay at %.1f fps; video "
+				     "delay %.1f ms instead of %.1f ms for this game (a larger ring setting fixes it)",
+				     gc->ring.size, 1e9 / gc->lock.period_ns, fit / 1000000.0,
+				     (double)gc->config.buffer_delay * obs_get_frame_interval_ns() / 1000000.0);
+			}
+		}
+	}
+	gc->lock.delay_ns = delay_ns;
+	target = (double)(int64_t)(tick_ns - delay_ns);
 	const double x = (double)(int64_t)gc->lock.anchor_counter + (target - gc->lock.anchor_ns) / gc->lock.period_ns;
 	const bool was_active = gc->lock.active;
 	/* the frame on screen: chosen by the timeline last tick, or whatever
@@ -663,6 +727,15 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 		if (c < oldest)
 			c = oldest;
 		gc->lock.active = true;
+	} else if (gc->lock.vfr) {
+		/* Phase 6 cadence: game_clock_tick places the ticks on the timeline
+		 * 1/(2m) frame clear of every frame boundary, so the frame due is
+		 * simply floor(x) (planned repeats and planned skips included);
+		 * never a step back.  After a stall the backlog is shown briefly
+		 * and the timeline is caught up, as the paced ticks did before. */
+		c = x > 0.0 ? (uint64_t)x : 0;
+		if (c < prev && prev <= newest)
+			c = prev;
 	} else {
 		const uint64_t next = prev + 1;
 		const double e = x - (double)(int64_t)next;
@@ -671,10 +744,10 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 			c = prev; /* the next frame is not due yet: repeat */
 		else if (e >= 2.0 + LOCK_HYSTERESIS)
 			c = (uint64_t)x; /* far behind (the game paused and resumed): resync */
-		else if (e >= 1.0 + LOCK_HYSTERESIS && !gc->lock.vfr)
+		else if (e >= 1.0 + LOCK_HYSTERESIS)
 			c = next + 1; /* the frame after next is due as well: skip one */
 		else
-			c = next; /* (game-clock output never skips: the paced ticks catch up) */
+			c = next;
 	}
 
 	if (c > newest) {
@@ -764,29 +837,84 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 	return true;
 }
 
-/* Frame-locked capture, Phase 5: game-clock output.
+/* Frame-locked capture, Phase 5/6: game-clock output with a cadence.
  *
  * Called once per tick after the frame for this tick was chosen.  While the
- * smoothed clock is trusted and the game is the slower clock (its period at
- * least 0.9 of the tick interval, the rate-floor regime in which CFR has to
- * repeat a frame for every frame the game did not make):
- *   - a frame's deadline is the tick it is meant to be shown at: its smoothed
- *     present time + (delay + 0.5) tick intervals, half a frame into its
- *     window so that lock_select sees it at pos 0.5 with hysteresis on both
- *     sides.  The next video tick is asked for at the next frame's deadline,
- *     so one tick consumes one game frame; the encoder turns the deadline
- *     into the frame's pts, so the file runs at the game's own rate and the
- *     stamps sit where the tick times would be (the audio sync offset keeps
- *     its meaning);
+ * smoothed clock is trusted, the recording follows the game's clock with a
+ * cadence of m output ticks per n game frames (cadence_choose): 1/1 for a
+ * 60 fps lock, 2/1 for a 30 fps lock, 1/2 for 120 Hz vsync, 5/12 for 144,
+ * 3/2 for 40 fps, 60/1 for 1 fps.  The ticks of a cycle sit on the game's
+ * timeline at x = (1/2 + j*n)/m, spaced n/m frames and 1/(2m) frame clear of
+ * every frame boundary, so the pattern is exact (every frame of a 30 fps game
+ * is shown twice, never once or three times) and clock jitter cannot flip it.
+ * The next video tick is asked for at the time of the next lattice point plus
+ * the buffer delay; the encoder stamps the frame with this tick's time.  The
+ * paced tick rate is the game's rate times m/n, within CADENCE_BAND of the
+ * output rate; in retimed mode the audio follows that residual (libobs,
+ * patch 0012), in VFR mode the stamps carry it.
  *   - while the game is stalled (this tick was starved) the nominal tick runs
  *     and the repeated frame is stamped with the tick time, so the stall is
  *     a run of ordinary repeats as in CFR.  Repeats are always encoded: the
  *     muxer only releases audio behind the newest video packet and NVENC
  *     holds the last B-frames until later frames arrive, so a tick without a
  *     frame would stall both for the length of a loading screen.
- * A faster game keeps CFR: when the game oversamples the recording a regular
- * cadence is right and VFR would only carry sampling jitter into the file.
+ *   - a game whose rate moves (an uncapped game, a 24 fps cutscene, a menu)
+ *     drifts out of CADENCE_KEEP; after CADENCE_CHANGE_NS the cadence is
+ *     chosen again (logged).  A rate the lock cannot follow refits the clock
+ *     (lock_reanchor burst) and the cadence re-engages on the new fit.
  * Everything here is ignored by libobs unless game-clock output is enabled. */
+
+static inline uint32_t cadence_gcd(uint32_t a, uint32_t b)
+{
+	while (b) {
+		const uint32_t t = a % b;
+		a = b;
+		b = t;
+	}
+	return a;
+}
+
+/* r = output ticks per game frame (game period over tick interval).  For
+ * n = 1, 2, ... the nearest m is tried; the first cadence whose residual is
+ * within band wins (the shortest cycle: fewest, most evenly placed planned
+ * repeats or skips), else the closest one within CADENCE_MAX_E.  false when
+ * nothing fits. */
+static bool cadence_choose(double r, double band, uint32_t *out_m, uint32_t *out_n, double *out_e)
+{
+	uint32_t best_m = 0, best_n = 0;
+	double best_e = 1.0;
+
+	if (!(r > 0.0))
+		return false;
+	for (uint32_t n = 1; n <= CADENCE_MAX_N; n++) {
+		uint32_t m = (uint32_t)lround((double)n * r);
+		double e;
+
+		if (m < 1)
+			m = 1;
+		if (cadence_gcd(m, n) != 1)
+			continue;
+		e = ((double)m / (double)n) / r - 1.0;
+		if (fabs(e) <= band) {
+			best_m = m;
+			best_n = n;
+			best_e = e;
+			break;
+		}
+		if (fabs(e) < fabs(best_e)) {
+			best_m = m;
+			best_n = n;
+			best_e = e;
+		}
+	}
+	if (!best_m || fabs(best_e) > CADENCE_MAX_E)
+		return false;
+	*out_m = best_m;
+	*out_n = best_n;
+	*out_e = best_e;
+	return true;
+}
+
 static void game_clock_tick(struct game_capture *gc, bool repeat)
 {
 	uint64_t frame_ts = 0, next_tick = 0;
@@ -795,37 +923,69 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 
 	if (gc->config.buffering && gc->lock.ready && gc->lock.active && obs_get_game_clock_enabled()) {
 		const uint64_t interval = obs_get_frame_interval_ns();
-		const double offset_ns = ((double)gc->config.buffer_delay + 0.5) * (double)interval;
-		const uint64_t c = gc->lock.shown;
+		const double r = gc->lock.period_ns / (double)interval; /* output ticks per game frame */
+		const uint64_t now = os_gettime_ns();
+		uint32_t m = gc->lock.cad_m, n = gc->lock.cad_n;
+		double e = gc->lock.cad_e;
 
-		vfr = gc->lock.period_ns >= 0.9 * (double)interval;
-		if (vfr && obs_get_game_clock_retime()) {
-			/* retimed CFR: the file runs at the game's rate and the audio
-			 * is trimmed to follow, by at most 5 % (obs-encoder.c).  A game
-			 * slower than that, a 30 or 45 fps game under a 60 fps output,
-			 * is left to the stock constant frame rate, which repeats its
-			 * frames and keeps the audio in real time.  Engages again (with
-			 * a little hysteresis) once the game is back within the band. */
-			const double limit = gc->lock.vfr ? 1.06 : 1.05;
+		if (m) {
+			e = ((double)m / (double)n) / r - 1.0;
+			if (fabs(e) > CADENCE_KEEP) {
+				if (!gc->lock.cad_out_ns) {
+					gc->lock.cad_out_ns = now;
+				} else if (now - gc->lock.cad_out_ns >= CADENCE_CHANGE_NS) {
+					uint32_t m2, n2;
+					double e2;
 
-			if (gc->lock.period_ns > limit * (double)interval) {
-				vfr = false;
-				if (!gc->lock.retime_refused) {
-					info("game-clock output: retime not engaged, the game runs %.1f %% slower than "
-					     "the output rate (limit 5 %%); constant frame rate for this source",
-					     (gc->lock.period_ns / (double)interval - 1.0) * 100.0);
-					gc->lock.retime_refused = true;
+					if (cadence_choose(r, CADENCE_BAND, &m2, &n2, &e2)) {
+						info("game-clock output: cadence %" PRIu32 "/%" PRIu32 " -> %" PRIu32 "/%" PRIu32
+						     " (game %.2f fps, residual %+.2f %%)",
+						     m, n, m2, n2, 1e9 / gc->lock.period_ns, e2 * 100.0);
+						m = m2;
+						n = n2;
+						e = e2;
+						gc->lock.cad_changes++;
+					} else {
+						m = n = 0;
+					}
+					gc->lock.cad_out_ns = 0;
 				}
 			} else {
-				gc->lock.retime_refused = false;
+				gc->lock.cad_out_ns = 0;
 			}
+		} else {
+			if (!cadence_choose(r, CADENCE_BAND, &m, &n, &e))
+				m = n = 0;
+			gc->lock.cad_out_ns = 0;
 		}
+		if (!m && !gc->lock.cad_refused) {
+			info("game-clock output: no cadence within %.0f %% for a game at %.2f fps; constant frame rate for "
+			     "this source",
+			     CADENCE_MAX_E * 100.0, 1e9 / gc->lock.period_ns);
+			gc->lock.cad_refused = true;
+		} else if (m) {
+			gc->lock.cad_refused = false;
+		}
+		gc->lock.cad_m = m;
+		gc->lock.cad_n = n;
+		gc->lock.cad_e = m ? e : 0.0;
+		vfr = m != 0;
+
 		if (vfr) {
 			if (gc->lock.starved_now) {
 				gc->lock.vfr_starved++;
 			} else {
-				frame_ts = (uint64_t)(lock_time_of(gc, c) + offset_ns);
-				next_tick = (uint64_t)(lock_time_of(gc, c + 1) + offset_ns);
+				/* this tick's position and the next lattice point n/m on:
+				 * m*x = 1/2 + j*n; round(j) snaps a tick that was not
+				 * placed (the first paced one, the one after a stall) */
+				const double x = (double)(int64_t)gc->lock.shown + gc->lock.pos;
+				const double step = (double)n / (double)m;
+				const double j = (double)llround(((double)m * (x + step) - 0.5) / (double)n);
+				const double xn = (0.5 + j * (double)n) / (double)m;
+				const double delay = (double)gc->lock.delay_ns;
+
+				frame_ts = (uint64_t)(lock_time_of_x(gc, x) + delay);
+				next_tick = (uint64_t)(lock_time_of_x(gc, xn) + delay);
 				gc->lock.vfr_paced++;
 			}
 			gc->lock.vfr_frames++;
@@ -836,13 +996,20 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 
 	if (vfr != gc->lock.vfr) {
 		if (vfr)
-			info("game-clock output: engaged (game period %.3f ms, tick %.3f ms)",
-			     gc->lock.period_ns / 1000000.0, obs_get_frame_interval_ns() / 1000000.0);
+			info("game-clock output: engaged (game %.2f fps, period %.3f ms, tick %.3f ms, cadence %" PRIu32 "/%" PRIu32
+			     ", residual %+.2f %%)",
+			     1e9 / gc->lock.period_ns, gc->lock.period_ns / 1000000.0,
+			     obs_get_frame_interval_ns() / 1000000.0, gc->lock.cad_m, gc->lock.cad_n, gc->lock.cad_e * 100.0);
 		else
 			info("game-clock output: released (%" PRIu64 " ticks, %" PRIu64 " paced, %" PRIu64
-			     " starved, %" PRIu64 " repeats)",
-			     gc->lock.vfr_frames, gc->lock.vfr_paced, gc->lock.vfr_starved, gc->lock.vfr_repeats);
+			     " starved, %" PRIu64 " repeats, %" PRIu64 " cadence changes)",
+			     gc->lock.vfr_frames, gc->lock.vfr_paced, gc->lock.vfr_starved, gc->lock.vfr_repeats,
+			     gc->lock.cad_changes);
 		gc->lock.vfr = vfr;
+		if (!vfr) {
+			gc->lock.cad_m = gc->lock.cad_n = 0;
+			gc->lock.cad_out_ns = 0;
+		}
 	}
 	gc->lock.vfr_now = vfr && !gc->lock.starved_now;
 	obs_video_set_game_clock_tick(frame_ts, next_tick, skip);
@@ -1073,7 +1240,7 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 		"#       time, slot), recording frame count, counter change since the previous tick (1 normal,\n"
 		"#       0 repeat, 2+ skip), the hook's running count of slot conflicts, and with buffering the\n"
 		"#       smoothed present time of the shown frame and its position on the timeline (frames);\n"
-		"#       note 'gc' = game-clock stamp (smoothed time + (delay+0.5) ticks), 'paused' = not recorded\n"
+		"#       note 'gc m/n' = game-clock stamp, paced with a cadence of m ticks per n game frames, 'paused' = not recorded\n"
 		"# all *_ns values are os_gettime_ns() (QueryPerformanceCounter) nanoseconds\n");
 	fprintf(gc->flog.file,
 		"kind,tick_ns,now_ns,counter,present_ns,out_frames,delta,note,slot,conflicts,smooth_ns,pos\n");
@@ -1202,7 +1369,8 @@ static void flog_tick(struct game_capture *gc)
 	if (obs_output_paused(output))
 		snprintf(note, sizeof(note), "paused");
 	if (gc->lock.vfr_now)
-		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%sgc", note[0] ? " " : "");
+		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%sgc %" PRIu32 "/%" PRIu32, note[0] ? " " : "",
+			 gc->lock.cad_m, gc->lock.cad_n);
 	if (gc->flog.lost || gc->ring.lost)
 		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%slost=%" PRIu64 "/%" PRIu64,
 			 note[0] ? " " : "", gc->flog.lost, gc->ring.lost);
@@ -3085,7 +3253,7 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, SETTING_HOOK_RATE, (int)HOOK_RATE_NORMAL);
 	obs_data_set_default_string(settings, SETTING_RGBA10A2_SPACE, RGBA10A2_SPACE_SRGB);
 	obs_data_set_default_bool(settings, SETTING_FRAME_LOG, false);
-	obs_data_set_default_int(settings, SETTING_FRAME_RING, 4);
+	obs_data_set_default_int(settings, SETTING_FRAME_RING, 8);
 	obs_data_set_default_bool(settings, SETTING_BUFFERING, true);
 	obs_data_set_default_int(settings, SETTING_BUFFER_DELAY, 2);
 }
