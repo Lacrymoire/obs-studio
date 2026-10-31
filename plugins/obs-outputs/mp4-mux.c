@@ -2820,10 +2820,20 @@ static inline void add_track(struct mp4_mux *mux, obs_encoder_t *enc)
 
 	/* Set timebase/timescale */
 	if (track->type == TRACK_VIDEO) {
-		video_t *video = obs_encoder_video(enc);
-		const struct video_output_info *info = video_output_get_info(video);
-		track->timebase_num = info->fps_den;
-		track->timebase_den = info->fps_num;
+		/* Phase 5 (game-clock output): the video encoder's timebase is
+		 * 1/(fps_num*1000) in VFR mode and its packets carry dts/pts in
+		 * that unit, so the track must use the encoder's timebase, not
+		 * the nominal frame rate (otherwise the file runs 1000x slow). */
+		uint32_t num = 0, den = 0;
+		obs_encoder_get_timebase(enc, &num, &den);
+		if (!num || !den) {
+			video_t *video = obs_encoder_video(enc);
+			const struct video_output_info *info = video_output_get_info(video);
+			num = info->fps_den;
+			den = info->fps_num;
+		}
+		track->timebase_num = num;
+		track->timebase_den = den;
 
 		track->timescale = track->timebase_den;
 	} else {
