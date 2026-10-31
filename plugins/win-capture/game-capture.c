@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <math.h>
 #include <obs-module.h>
 #include <obs-hotkey.h>
 #include <util/dstr.h>
@@ -138,6 +139,9 @@ struct game_capture_config {
 #define LOCK_HYSTERESIS 0.1     /* frames; a repeat or skip needs the timeline this far past the edge */
 #define LOCK_MAX_COUNTER_GAP 16 /* presents missing in a row: the game paused, refit from scratch */
 #define LOCK_MAX_TIME_GAP_NS 250000000ULL
+#define LOCK_HARD_GAP 3.0       /* periods; a present gap this long re-anchors the clock at once */
+#define LOCK_SETTLE 0.33        /* fraction of the period: consecutive gaps this close to it mean the clock settled */
+#define LOCK_PENDING_MAX 9      /* presents off the line kept back before the clock counts as lost */
 
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetThreadDpiAwarenessContext)(VOID);
@@ -239,7 +243,12 @@ struct game_capture {
 		uint64_t anchor_counter;
 		uint64_t last_counter;
 		uint64_t last_time_ns;
-		uint64_t resets;
+		/* presents off the fitted line, kept out of the window until the
+		 * clock settles (lock_add) */
+		uint64_t pending_counters[LOCK_PENDING_MAX];
+		uint64_t pending_times[LOCK_PENDING_MAX];
+		uint32_t pending_n;
+		uint64_t resets, reanchors, outliers;
 		bool active;             /* a frame has been chosen by the timeline */
 		uint64_t shown;          /* the frame chosen last tick */
 		double pos;              /* position of the chosen frame within its tick window */
@@ -260,7 +269,7 @@ struct game_capture {
 		bool waiting_logged;
 		bool blocked_logged;
 		/* lock counters when the log opened, so the close line reports this recording only */
-		uint64_t repeats0, skips0, starved0, lagged0, resets0;
+		uint64_t repeats0, skips0, starved0, lagged0, resets0, reanchors0;
 	} flog;
 
 	PFN_SetThreadDpiAwarenessContext set_thread_dpi_awareness_context;
@@ -398,9 +407,18 @@ static inline float hook_rate_to_float(enum hook_rate rate)
  * frame, and only when x is more than LOCK_HYSTERESIS frames past the next
  * one does it skip.  A clock difference between game and OBS then produces one
  * single repeat or skip per beat period, never a burst, because the decision
- * follows the smooth line and the hysteresis is far wider than its noise.  A
- * jump in the present times (loading screen, pause, alt-tab) clears the fit;
- * until it is trusted again the newest frame is shown, as in Phase 2. */
+ * follows the smooth line and the hysteresis is far wider than its noise.
+ *
+ * Phase 4 (patch 0006): the fitted period survives a jump in the present
+ * times; only the anchor moves.  A hard stall (a gap of LOCK_HARD_GAP periods
+ * or more, a counter restart) re-anchors at once, so a loading screen or an
+ * engine hitch is one hold that ends when the buffer delay is rebuilt.  A
+ * shorter hitch is held back, because the game often catches up with a burst
+ * of quick presents: its points stay out of the window until two consecutive
+ * normal gaps show where the clock settled, and the anchor moves there only
+ * if that is more than half a period off the old line.  Only a cold start, or
+ * a clock that never settles, refits from scratch; until that fit is trusted
+ * ring_tick() steps one frame per tick. */
 
 static void lock_reset(struct game_capture *gc, const char *why)
 {
@@ -408,14 +426,144 @@ static void lock_reset(struct game_capture *gc, const char *why)
 		gc->lock.resets++;
 	gc->lock.n = 0;
 	gc->lock.head = 0;
+	gc->lock.pending_n = 0;
 	gc->lock.ready = false;
 	gc->lock.active = false;
 	if (why && gc->config.frame_log)
 		info("frame lock: refit (%s)", why);
 }
 
+/* a new hook (ring_open): the window, the pending points and the frame on
+ * screen mean nothing any more; the fitted period is carried over and the
+ * statistics, reported per recording, are kept */
+static void lock_reopen(struct game_capture *gc)
+{
+	const uint64_t repeats = gc->lock.repeats, skips = gc->lock.skips, starved = gc->lock.starved,
+		       lagged = gc->lock.lagged, resets = gc->lock.resets, reanchors = gc->lock.reanchors,
+		       outliers = gc->lock.outliers;
+	const double period_ns = gc->lock.period_ns;
+	const bool ready = gc->lock.ready;
+
+	memset(&gc->lock, 0, sizeof(gc->lock));
+	gc->lock.repeats = repeats;
+	gc->lock.skips = skips;
+	gc->lock.starved = starved;
+	gc->lock.lagged = lagged;
+	gc->lock.resets = resets;
+	gc->lock.reanchors = reanchors;
+	gc->lock.outliers = outliers;
+	gc->lock.period_ns = period_ns;
+	gc->lock.ready = ready;
+}
+
+static inline void lock_window_add(struct game_capture *gc, uint64_t counter, uint64_t time_ns)
+{
+	gc->lock.counters[gc->lock.head] = counter;
+	gc->lock.times[gc->lock.head] = time_ns;
+	gc->lock.head = (gc->lock.head + 1) % LOCK_FIT_N;
+	if (gc->lock.n < LOCK_FIT_N)
+		gc->lock.n++;
+	gc->lock.last_counter = counter;
+	gc->lock.last_time_ns = time_ns;
+}
+
+static inline void lock_pending_add(struct game_capture *gc, uint64_t counter, uint64_t time_ns)
+{
+	if (gc->lock.pending_n < LOCK_PENDING_MAX) {
+		gc->lock.pending_counters[gc->lock.pending_n] = counter;
+		gc->lock.pending_times[gc->lock.pending_n] = time_ns;
+		gc->lock.pending_n++;
+	}
+	gc->lock.last_counter = counter;
+	gc->lock.last_time_ns = time_ns;
+}
+
+/* smoothed present time of frame counter on the fitted clock */
+static inline double lock_time_of(const struct game_capture *gc, uint64_t counter)
+{
+	return gc->lock.anchor_ns + (double)(int64_t)(counter - gc->lock.anchor_counter) * gc->lock.period_ns;
+}
+
+/* the clock moved: keep its period, start the window again from this record */
+static void lock_reanchor(struct game_capture *gc, uint64_t counter, uint64_t time_ns, const char *why, bool new_space)
+{
+	gc->lock.reanchors++;
+	gc->lock.n = 0;
+	gc->lock.head = 0;
+	gc->lock.pending_n = 0;
+	gc->lock.anchor_counter = counter;
+	gc->lock.anchor_ns = (double)time_ns;
+	if (new_space) {
+		/* the counters restarted: the frame on screen cannot be compared */
+		gc->lock.active = false;
+		gc->lock.shown = 0;
+	}
+	if (gc->config.frame_log)
+		info("frame lock: re-anchor (%s)", why);
+}
+
 static void lock_add(struct game_capture *gc, uint64_t counter, uint64_t time_ns)
 {
+	if (gc->lock.ready && (gc->lock.n || gc->lock.pending_n)) {
+		const uint64_t gap = time_ns - gc->lock.last_time_ns;
+		double err;
+
+		if (counter <= gc->lock.last_counter) {
+			lock_reanchor(gc, counter, time_ns, "counter went backwards", true);
+			lock_window_add(gc, counter, time_ns);
+			return;
+		}
+		if (gap > LOCK_MAX_TIME_GAP_NS || (double)gap >= LOCK_HARD_GAP * gc->lock.period_ns) {
+			lock_reanchor(gc, counter, time_ns, "long pause", false);
+			lock_window_add(gc, counter, time_ns);
+			return;
+		}
+
+		err = (double)time_ns - lock_time_of(gc, counter);
+		if (gc->lock.pending_n == 0) {
+			if (fabs(err) <= gc->lock.period_ns)
+				lock_window_add(gc, counter, time_ns);
+			else
+				lock_pending_add(gc, counter, time_ns);
+			return;
+		}
+
+		lock_pending_add(gc, counter, time_ns);
+		{
+			const uint32_t n = gc->lock.pending_n;
+			const uint64_t *pc = gc->lock.pending_counters;
+			const uint64_t *pt = gc->lock.pending_times;
+			bool settled = false;
+
+			if (n >= 3) {
+				const double g1 = (double)(pt[n - 1] - pt[n - 2]) - gc->lock.period_ns;
+				const double g2 = (double)(pt[n - 2] - pt[n - 3]) - gc->lock.period_ns;
+				settled = fabs(g1) <= LOCK_SETTLE * gc->lock.period_ns &&
+					  fabs(g2) <= LOCK_SETTLE * gc->lock.period_ns;
+			}
+			if (settled) {
+				const uint64_t c1 = pc[n - 2], t1 = pt[n - 2], c2 = pc[n - 1], t2 = pt[n - 1];
+				const double off = (((double)t1 - lock_time_of(gc, c1)) + ((double)t2 - lock_time_of(gc, c2))) / 2.0;
+
+				if (fabs(off) > 0.5 * gc->lock.period_ns) {
+					lock_reanchor(gc, c1, t1, "clock shifted", false);
+				} else {
+					/* a hitch the game caught up from: the line stands */
+					gc->lock.outliers += n - 2;
+					gc->lock.pending_n = 0;
+				}
+				lock_window_add(gc, c1, t1);
+				lock_window_add(gc, c2, t2);
+			} else if (n >= LOCK_PENDING_MAX) {
+				/* nothing like the old clock any more: start over */
+				lock_reset(gc, "clock lost");
+				lock_window_add(gc, counter, time_ns);
+			}
+		}
+		return;
+	}
+
+	/* cold start: no trusted clock yet */
 	if (gc->lock.n) {
 		const uint64_t dc = counter - gc->lock.last_counter;
 		const uint64_t dt = time_ns - gc->lock.last_time_ns;
@@ -426,24 +574,8 @@ static void lock_add(struct game_capture *gc, uint64_t counter, uint64_t time_ns
 			lock_reset(gc, "presents missing");
 		else if (dt > LOCK_MAX_TIME_GAP_NS)
 			lock_reset(gc, "long pause");
-		else if (gc->lock.ready) {
-			/* a frame far off the fitted line: the clock jumped */
-			const double predicted = gc->lock.anchor_ns +
-						 (double)(int64_t)(counter - gc->lock.anchor_counter) *
-							 gc->lock.period_ns;
-			const double err = (double)(int64_t)(time_ns - (uint64_t)predicted);
-			if (err > gc->lock.period_ns || err < -gc->lock.period_ns)
-				lock_reset(gc, "present time jumped");
-		}
 	}
-
-	gc->lock.counters[gc->lock.head] = counter;
-	gc->lock.times[gc->lock.head] = time_ns;
-	gc->lock.head = (gc->lock.head + 1) % LOCK_FIT_N;
-	if (gc->lock.n < LOCK_FIT_N)
-		gc->lock.n++;
-	gc->lock.last_counter = counter;
-	gc->lock.last_time_ns = time_ns;
+	lock_window_add(gc, counter, time_ns);
 }
 
 /* least squares of present time over counter, in coordinates relative to the
@@ -456,10 +588,10 @@ static void lock_fit(struct game_capture *gc)
 	const uint64_t t0 = gc->lock.times[newest];
 	double sx = 0, sy = 0, sxx = 0, sxy = 0, mx, my, vxx, vxy;
 
-	if (n < LOCK_FIT_MIN) {
-		gc->lock.ready = false;
+	if (n == 0)
 		return;
-	}
+	if (n < LOCK_FIT_MIN && !gc->lock.ready)
+		return;
 
 	for (uint32_t i = 0; i < n; i++) {
 		const uint32_t k = (newest + LOCK_FIT_N - i) % LOCK_FIT_N;
@@ -472,6 +604,13 @@ static void lock_fit(struct game_capture *gc)
 	}
 	mx = sx / n;
 	my = sy / n;
+	if (n < LOCK_FIT_MIN) {
+		/* re-anchored: the carried period, the anchor on the mean of what
+		 * the window holds so far */
+		gc->lock.anchor_counter = c0;
+		gc->lock.anchor_ns = (double)t0 + (my - gc->lock.period_ns * mx);
+		return;
+	}
 	vxx = sxx - n * mx * mx;
 	vxy = sxy - n * mx * my;
 	if (vxx <= 0.0) {
@@ -483,12 +622,6 @@ static void lock_fit(struct game_capture *gc)
 	gc->lock.anchor_counter = c0;
 	gc->lock.anchor_ns = (double)t0 + (my - gc->lock.period_ns * mx);
 	gc->lock.ready = gc->lock.period_ns > 1000000.0; /* a sane clock runs slower than 1000 fps */
-}
-
-/* smoothed present time of frame counter on the fitted clock */
-static inline double lock_time_of(const struct game_capture *gc, uint64_t counter)
-{
-	return gc->lock.anchor_ns + (double)(int64_t)(counter - gc->lock.anchor_counter) * gc->lock.period_ns;
 }
 
 /* chooses the frame counter to show at nominal tick time tick_ns; newest is the
@@ -510,8 +643,10 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 		 * never a step back from the frame already on screen (after a refit
 		 * that would play motion in reverse); repeating it catches up */
 		c = x > 0.0 ? (uint64_t)x : 0;
-		if (c < prev)
-			c = prev;
+		if (c < prev && prev <= newest)
+			c = prev; /* prev > newest: the counters restarted */
+		if (c < oldest)
+			c = oldest;
 		gc->lock.active = true;
 	} else {
 		const uint64_t next = prev + 1;
@@ -606,7 +741,7 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 	gc->ring.size = n;
 	gc->ring.shown_slot = 0;
 	gc->shtex_data->read_slot = 0;
-	memset(&gc->lock, 0, sizeof(gc->lock));
+	lock_reopen(gc);
 	info("frame ring: %u slots of %" PRIu32 "x%" PRIu32 "; buffering %s, delay %" PRIu32 " frame%s", n, gc->cx,
 	     gc->cy, gc->config.buffering ? "on" : "off", gc->config.buffer_delay,
 	     gc->config.buffer_delay == 1 ? "" : "s");
@@ -733,10 +868,12 @@ static void flog_close(struct game_capture *gc, const char *reason)
 		fclose(gc->flog.file);
 		gc->flog.file = NULL;
 		info("frame log closed (%s): %s, %" PRIu64 " ticks, %" PRIu64 " lost log entries; frame lock: %" PRIu64
-		     " repeats, %" PRIu64 " skips, %" PRIu64 " starved, %" PRIu64 " lagged, %" PRIu64 " refits",
+		     " repeats, %" PRIu64 " skips, %" PRIu64 " starved, %" PRIu64 " lagged, %" PRIu64 " refits, %" PRIu64
+		     " re-anchors",
 		     reason, gc->flog.path, gc->flog.ticks, gc->flog.lost, gc->lock.repeats - gc->flog.repeats0,
 		     gc->lock.skips - gc->flog.skips0, gc->lock.starved - gc->flog.starved0,
-		     gc->lock.lagged - gc->flog.lagged0, gc->lock.resets - gc->flog.resets0);
+		     gc->lock.lagged - gc->flog.lagged0, gc->lock.resets - gc->flog.resets0,
+		     gc->lock.reanchors - gc->flog.reanchors0);
 	}
 
 	if (gc->flog.output) {
@@ -813,6 +950,7 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 	gc->flog.starved0 = gc->lock.starved;
 	gc->flog.lagged0 = gc->lock.lagged;
 	gc->flog.resets0 = gc->lock.resets;
+	gc->flog.reanchors0 = gc->lock.reanchors;
 
 	obs_get_video_info(&ovi);
 	fprintf(gc->flog.file, "# obs-frame-lock log v3\n");
