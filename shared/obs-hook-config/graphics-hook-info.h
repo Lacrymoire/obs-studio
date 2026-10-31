@@ -72,8 +72,24 @@ struct shmem_data {
 	uint32_t tex2_offset;
 };
 
+/* Frame-locked capture: the hook records every frame it copied into the shared
+ * texture (counter and present time) in this ring, and OBS reads it once per
+ * video tick (Phase 1 instrumentation; the frame ring of Phase 2 builds on it).
+ * Times are os_gettime_ns() values: QueryPerformanceCounter scaled to
+ * nanoseconds, the clock libobs uses for obs_get_video_frame_time(). */
+#define SHTEX_LOG_VERSION 1
+#define PRESENT_LOG_SIZE 64
+
+struct present_record {
+	uint64_t time_ns; /* when the hook copied the frame, just before the game's Present ran */
+	uint64_t counter; /* 1-based count of copied frames since capture init */
+};
+
 struct shtex_data {
 	uint32_t tex_handle;
+	uint32_t log_version;            /* SHTEX_LOG_VERSION, so OBS can tell which layout it reads */
+	volatile uint64_t present_count; /* records written; record i is present_log[i % PRESENT_LOG_SIZE] */
+	struct present_record present_log[PRESENT_LOG_SIZE];
 };
 
 enum capture_type {

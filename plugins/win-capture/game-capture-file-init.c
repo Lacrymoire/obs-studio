@@ -151,6 +151,16 @@ char *get_hook_path(bool b64)
 {
 	wchar_t path[MAX_PATH];
 
+	/* Frame-locked build: inject the graphics hook shipped next to this
+	 * plugin (core\win-capture\data), never the copy in
+	 * %ProgramData%\obs-studio-hook.  update_hook_file() only replaces that
+	 * copy when our file version is higher, and this build carries the same
+	 * version as the stock OBS that installed it, so the stock hook (without
+	 * the present log) would be injected instead of ours. */
+	char *own_hook = obs_module_file(b64 ? "graphics-hook64.dll" : "graphics-hook32.dll");
+	if (own_hook)
+		return own_hook;
+
 	get_programdata_path(path, L"obs-studio-hook\\");
 	make_filename(path, L"graphics-hook", L".dll");
 

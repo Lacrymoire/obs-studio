@@ -42,6 +42,7 @@
 #define SETTING_HOOK_RATE            "hook_rate"
 #define SETTING_RGBA10A2_SPACE       "rgb10a2_space"
 #define SETTINGS_COMPAT_INFO         "compat_info"
+#define SETTING_FRAME_LOG            "framelock_log"
 
 /* deprecated */
 #define SETTING_ANY_FULLSCREEN   "capture_any_fullscreen"
@@ -76,6 +77,8 @@
 #define TEXT_RGBA10A2_SPACE        obs_module_text("GameCapture.Rgb10a2Space")
 #define TEXT_RGBA10A2_SPACE_SRGB   obs_module_text("GameCapture.Rgb10a2Space.Srgb")
 #define TEXT_RGBA10A2_SPACE_2100PQ obs_module_text("GameCapture.Rgb10a2Space.2100PQ")
+#define TEXT_FRAME_LOG             obs_module_text("GameCapture.FrameLog")
+#define TEXT_FRAME_LOG_TT          obs_module_text("GameCapture.FrameLog.Description")
 
 #define TEXT_MODE_ANY            TEXT_ANY_FULLSCREEN
 #define TEXT_MODE_WINDOW         obs_module_text("GameCapture.CaptureWindow")
@@ -112,6 +115,7 @@ struct game_capture_config {
 	enum hook_rate hook_rate;
 	bool is_10a2_2100pq;
 	bool capture_audio;
+	bool frame_log;
 };
 
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
@@ -189,6 +193,20 @@ struct game_capture {
 	};
 
 	void (*copy_texture)(struct game_capture *);
+
+	/* frame-locked capture: Phase 1 debug log state (see flog_tick) */
+	struct {
+		FILE *file;
+		char *path;
+		obs_weak_output_t *output;
+		uint64_t presents_read;
+		uint64_t last_counter;
+		uint64_t lost;
+		uint64_t ticks;
+		uint32_t check_countdown;
+		bool waiting_logged;
+		bool blocked_logged;
+	} flog;
 
 	PFN_SetThreadDpiAwarenessContext set_thread_dpi_awareness_context;
 	PFN_GetThreadDpiAwarenessContext get_thread_dpi_awareness_context;
@@ -309,8 +327,259 @@ static inline float hook_rate_to_float(enum hook_rate rate)
 	}
 }
 
+/* ------------------------------------------------------------------------- */
+/* Frame-locked capture, Phase 1 instrumentation.
+ *
+ * While a recording output is active and the "Frame-lock debug log" setting is
+ * on, the source writes <recording file>.frames.csv next to the recording:
+ *   present rows: every frame the hook copied into the shared texture (counter
+ *                 and present time), read from the ring in the shared data block;
+ *   tick rows:    one per OBS video tick: the tick's nominal time, the wall time
+ *                 the tick ran, the newest copied frame at that moment (what the
+ *                 single shared texture holds, so what the render pass draws),
+ *                 the recording's frame count, and the counter change since the
+ *                 previous tick (1 = one new game frame, 0 = repeat, 2+ = skip).
+ * All *_ns values are os_gettime_ns() nanoseconds, the clock libobs uses for
+ * obs_get_video_frame_time(); the hook stamps frames with the same clock.
+ * Diagnostics only: nothing here changes what is captured or drawn. */
+
+#define FLOG_CHECK_TICKS 15
+
+static bool flog_find_recording(void *param, obs_output_t *output)
+{
+	obs_weak_output_t **found = param;
+	const char *id = obs_output_get_id(output);
+
+	if (!id || !obs_output_active(output))
+		return true;
+
+	if (strcmp(id, "ffmpeg_muxer") == 0 || strcmp(id, "mp4_output") == 0 || strcmp(id, "mov_output") == 0 ||
+	    strcmp(id, "ffmpeg_output") == 0) {
+		*found = obs_output_get_weak_output(output);
+		return false;
+	}
+
+	return true;
+}
+
+static void flog_close(struct game_capture *gc, const char *reason)
+{
+	if (gc->flog.file) {
+		fprintf(gc->flog.file, "end,%" PRIu64 ",%" PRIu64 ",,,,,%s\n", obs_get_video_frame_time(),
+			os_gettime_ns(), reason);
+		fclose(gc->flog.file);
+		gc->flog.file = NULL;
+		info("frame log closed (%s): %s, %" PRIu64 " ticks, %" PRIu64 " lost log entries", reason,
+		     gc->flog.path, gc->flog.ticks, gc->flog.lost);
+	}
+
+	if (gc->flog.output) {
+		obs_weak_output_release(gc->flog.output);
+		gc->flog.output = NULL;
+	}
+
+	bfree(gc->flog.path);
+	gc->flog.path = NULL;
+	gc->flog.presents_read = 0;
+	gc->flog.last_counter = 0;
+	gc->flog.lost = 0;
+	gc->flog.ticks = 0;
+	gc->flog.check_countdown = 0;
+	gc->flog.waiting_logged = false;
+	gc->flog.blocked_logged = false;
+}
+
+static bool flog_list_active_output(void *param, obs_output_t *output)
+{
+	struct dstr *list = param;
+
+	if (obs_output_active(output)) {
+		if (!dstr_is_empty(list))
+			dstr_cat(list, ", ");
+		dstr_catf(list, "%s ('%s')", obs_output_get_id(output), obs_output_get_name(output));
+	}
+
+	return true;
+}
+
+static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_output_t *output)
+{
+	const volatile struct shtex_data *shtex = gc->shtex_data;
+	struct obs_video_info ovi = {0};
+	obs_data_t *settings = obs_output_get_settings(output);
+	const char *id = obs_output_get_id(output);
+	struct dstr rec = {0};
+	struct dstr path = {0};
+	uint64_t count, latest;
+
+	dstr_copy(&rec, obs_data_get_string(settings, strcmp(id, "ffmpeg_output") == 0 ? "url" : "path"));
+	obs_data_release(settings);
+
+	if (dstr_is_empty(&rec)) {
+		dstr_free(&rec);
+		return;
+	}
+
+	dstr_copy_dstr(&path, &rec);
+	dstr_cat(&path, ".frames.csv");
+
+	gc->flog.file = os_fopen(path.array, "wb");
+	if (!gc->flog.file) {
+		warn("frame log: could not open '%s'", path.array);
+		dstr_free(&path);
+		dstr_free(&rec);
+		return;
+	}
+
+	setvbuf(gc->flog.file, NULL, _IOFBF, 1 << 16);
+	gc->flog.path = path.array;
+	gc->flog.output = weak;
+	obs_weak_output_addref(weak);
+
+	count = shtex->present_count;
+	latest = count ? shtex->present_log[(count - 1) % PRESENT_LOG_SIZE].time_ns : 0;
+	gc->flog.presents_read = count;
+	gc->flog.last_counter = count;
+	gc->flog.lost = 0;
+	gc->flog.ticks = 0;
+
+	obs_get_video_info(&ovi);
+	fprintf(gc->flog.file, "# obs-frame-lock log v1\n");
+	fprintf(gc->flog.file,
+		"# obs=%s fps=%" PRIu32 "/%" PRIu32 " base=%" PRIu32 "x%" PRIu32 " output=%" PRIu32 "x%" PRIu32
+		" capture=%" PRIu32 "x%" PRIu32 " source=%s recording=%s\n",
+		obs_get_version_string(), ovi.fps_num, ovi.fps_den, ovi.base_width, ovi.base_height,
+		ovi.output_width, ovi.output_height, gc->cx, gc->cy, obs_source_get_name(gc->source), rec.array);
+	fprintf(gc->flog.file,
+		"# present: one row per frame the hook copied (counter, present time)\n"
+		"# tick: one row per OBS video tick: nominal tick time, wall time, newest copied frame and its time,\n"
+		"#       recording frame count, counter change since the previous tick (1 normal, 0 repeat, 2+ skip)\n"
+		"# all *_ns values are os_gettime_ns() (QueryPerformanceCounter) nanoseconds\n");
+	fprintf(gc->flog.file, "kind,tick_ns,now_ns,counter,present_ns,out_frames,delta,note\n");
+	fprintf(gc->flog.file, "start,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,,\n",
+		obs_get_video_frame_time(), os_gettime_ns(), count, latest, obs_output_get_total_frames(output));
+
+	info("frame log opened: %s", path.array);
+	dstr_free(&rec);
+}
+
+static void flog_tick(struct game_capture *gc)
+{
+	const bool capturing = gc->config.frame_log && gc->capturing && gc->shtex_data;
+	const bool enabled = capturing && gc->global_hook_info->type == CAPTURE_TYPE_TEXTURE &&
+			     gc->shtex_data->log_version == SHTEX_LOG_VERSION;
+	const volatile struct shtex_data *shtex;
+	obs_output_t *output = NULL;
+	uint64_t count, read, latest, tick_ns, now_ns;
+	int64_t delta;
+	char note[64];
+
+	if (!enabled) {
+		if (gc->flog.file)
+			flog_close(gc, "capture stopped");
+
+		/* say once per capture why the log cannot run */
+		if (capturing && !gc->flog.blocked_logged) {
+			gc->flog.blocked_logged = true;
+			if (gc->global_hook_info->type != CAPTURE_TYPE_TEXTURE)
+				warn("frame log: capture runs in shared-memory mode (SLI/Crossfire compatibility or no "
+				     "shared-texture support); the present log needs shared-texture capture");
+			else
+				warn("frame log: the hook's shared data block has no present log (log_version=%" PRIu32
+				     "); the graphics-hook DLL loaded in the game is not this build's (see the "
+				     "'injecting graphics hook' line above); restart the game",
+				     gc->shtex_data->log_version);
+		}
+		return;
+	}
+
+	if (gc->flog.output) {
+		output = obs_weak_output_get_output(gc->flog.output);
+		if (output && !obs_output_active(output)) {
+			obs_output_release(output);
+			output = NULL;
+		}
+		if (!output)
+			flog_close(gc, "recording stopped");
+	}
+
+	if (!gc->flog.file) {
+		obs_weak_output_t *weak = NULL;
+
+		if (gc->flog.check_countdown > 0) {
+			gc->flog.check_countdown--;
+			return;
+		}
+		gc->flog.check_countdown = FLOG_CHECK_TICKS;
+
+		obs_enum_outputs(flog_find_recording, &weak);
+		if (!weak) {
+			if (!gc->flog.waiting_logged) {
+				struct dstr active_outputs = {0};
+
+				gc->flog.waiting_logged = true;
+				obs_enum_outputs(flog_list_active_output, &active_outputs);
+				info("frame log: on, waiting for a recording to start (active outputs now: %s)",
+				     dstr_is_empty(&active_outputs) ? "none" : active_outputs.array);
+				dstr_free(&active_outputs);
+			}
+			return;
+		}
+
+		output = obs_weak_output_get_output(weak);
+		if (output)
+			flog_open(gc, weak, output);
+		obs_weak_output_release(weak);
+
+		if (!gc->flog.file) {
+			if (output)
+				obs_output_release(output);
+			return;
+		}
+	}
+
+	shtex = gc->shtex_data;
+	count = shtex->present_count;
+	read = gc->flog.presents_read;
+
+	if (count < read) {
+		/* the hook re-initialized its capture and restarted the counter */
+		read = 0;
+		gc->flog.last_counter = 0;
+	}
+	if (count - read > PRESENT_LOG_SIZE) {
+		gc->flog.lost += count - read - PRESENT_LOG_SIZE;
+		read = count - PRESENT_LOG_SIZE;
+	}
+	for (; read < count; read++) {
+		const volatile struct present_record *rec = &shtex->present_log[read % PRESENT_LOG_SIZE];
+		fprintf(gc->flog.file, "present,,,%" PRIu64 ",%" PRIu64 ",,,\n", rec->counter, rec->time_ns);
+	}
+
+	tick_ns = obs_get_video_frame_time();
+	now_ns = os_gettime_ns();
+	latest = count ? shtex->present_log[(count - 1) % PRESENT_LOG_SIZE].time_ns : 0;
+	delta = (int64_t)(count - gc->flog.last_counter);
+	note[0] = 0;
+	if (gc->flog.lost)
+		snprintf(note, sizeof(note), "lost=%" PRIu64, gc->flog.lost);
+
+	fprintf(gc->flog.file, "tick,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%" PRId64 ",%s\n", tick_ns,
+		now_ns, count, latest, obs_output_get_total_frames(output), delta, note);
+
+	gc->flog.presents_read = count;
+	gc->flog.last_counter = count;
+	gc->flog.ticks++;
+
+	obs_output_release(output);
+}
+
+/* ------------------------------------------------------------------------- */
+
 static void stop_capture(struct game_capture *gc)
 {
+	flog_close(gc, "capture stopped");
+
 	ipc_pipe_server_free(&gc->pipe);
 
 	if (gc->hook_stop) {
@@ -446,6 +715,7 @@ static inline void get_config(struct game_capture_config *cfg, obs_data_t *setti
 	cfg->hook_rate = (enum hook_rate)obs_data_get_int(settings, SETTING_HOOK_RATE);
 	cfg->is_10a2_2100pq = strcmp(obs_data_get_string(settings, SETTING_RGBA10A2_SPACE), "2100pq") == 0;
 	cfg->capture_audio = obs_data_get_bool(settings, SETTING_CAPTURE_AUDIO);
+	cfg->frame_log = obs_data_get_bool(settings, SETTING_FRAME_LOG);
 }
 
 static inline int s_cmp(const char *str1, const char *str2)
@@ -550,6 +820,9 @@ static void game_capture_update(void *data, obs_data_t *settings)
 
 	free_config(&gc->config);
 	gc->config = cfg;
+	info("frame-lock debug log: %s", gc->config.frame_log ? "on" : "off");
+	if (!gc->config.frame_log)
+		flog_close(gc, "log disabled");
 	gc->retry_interval = DEFAULT_RETRY_INTERVAL * hook_rate_to_float(gc->config.hook_rate);
 	gc->wait_for_target_startup = false;
 	gc->is_10a2_2100pq = gc->config.is_10a2_2100pq;
@@ -938,6 +1211,8 @@ static inline bool inject_hook(struct game_capture *gc)
 	if (!check_file_integrity(gc, hook_path, "graphics hook")) {
 		goto cleanup;
 	}
+
+	info("injecting graphics hook: %s", hook_path);
 
 #ifdef _WIN64
 	matching_architecture = gc->process_is_64bit;
@@ -1848,6 +2123,8 @@ static void game_capture_tick(void *data, float seconds)
 		}
 	}
 
+	flog_tick(gc);
+
 	if (!gc->showing)
 		gc->showing = true;
 }
@@ -2117,6 +2394,7 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, true);
 	obs_data_set_default_int(settings, SETTING_HOOK_RATE, (int)HOOK_RATE_NORMAL);
 	obs_data_set_default_string(settings, SETTING_RGBA10A2_SPACE, RGBA10A2_SPACE_SRGB);
+	obs_data_set_default_bool(settings, SETTING_FRAME_LOG, false);
 }
 
 static bool mode_callback(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)
@@ -2276,6 +2554,9 @@ static obs_properties_t *game_capture_properties(void *data)
 	obs_properties_add_bool(ppts, SETTING_ANTI_CHEAT_HOOK, TEXT_ANTI_CHEAT_HOOK);
 
 	obs_properties_add_bool(ppts, SETTING_CAPTURE_OVERLAYS, TEXT_CAPTURE_OVERLAYS);
+
+	p = obs_properties_add_bool(ppts, SETTING_FRAME_LOG, TEXT_FRAME_LOG);
+	obs_property_set_long_description(p, TEXT_FRAME_LOG_TT);
 
 	p = obs_properties_add_list(ppts, SETTING_HOOK_RATE, TEXT_HOOK_RATE, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, TEXT_HOOK_RATE_SLOW, HOOK_RATE_SLOW);

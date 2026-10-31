@@ -98,6 +98,26 @@ static inline void *get_offset_addr(HMODULE module, uint32_t offset)
 	return (void *)((uintptr_t)module + (uintptr_t)offset);
 }
 
+/* Frame-locked capture: record one copied frame in the shared present log (see
+ * struct shtex_data).  Called by a capture path right after it copied the frame
+ * into the shared texture.  The record is written first and the count published
+ * last with an interlocked store, so the OBS side never reads a half-written
+ * record and the 64-bit count stays atomic from the 32-bit hook as well. */
+static inline void capture_log_present(struct shtex_data *shtex)
+{
+	uint64_t n;
+	struct present_record *rec;
+
+	if (!shtex)
+		return;
+
+	n = shtex->present_count;
+	rec = &shtex->present_log[n % PRESENT_LOG_SIZE];
+	rec->time_ns = os_gettime_ns();
+	rec->counter = n + 1;
+	InterlockedExchange64((volatile LONG64 *)&shtex->present_count, (LONG64)(n + 1));
+}
+
 /* ------------------------------------------------------------------------- */
 
 extern ipc_pipe_client_t pipe;

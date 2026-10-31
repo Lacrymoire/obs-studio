@@ -549,6 +549,9 @@ bool capture_init_shtex(struct shtex_data **data, HWND window, uint32_t cx, uint
 
 	*data = shmem_info;
 	(*data)->tex_handle = (uint32_t)handle;
+	(*data)->log_version = SHTEX_LOG_VERSION;
+	(*data)->present_count = 0;
+	hlog("frame-lock present log v%d ready (%d records)", (int)SHTEX_LOG_VERSION, (int)PRESENT_LOG_SIZE);
 
 	global_hook_info->hook_ver_major = HOOK_VER_MAJOR;
 	global_hook_info->hook_ver_minor = HOOK_VER_MINOR;
