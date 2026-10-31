@@ -176,6 +176,7 @@ obs_encoder_t *obs_audio_encoder_create(const char *id, const char *name, obs_da
 static void receive_video(void *param, struct video_data *frame);
 static void receive_audio(void *param, size_t mix_idx, struct audio_data *data);
 static void retime_reset(struct obs_encoder *encoder);
+static int64_t retime_sys_dts_usec(struct obs_encoder *encoder, const struct encoder_packet *pkt, int64_t sys);
 
 static inline void get_audio_info(const struct obs_encoder *encoder, struct audio_convert_info *info)
 {
@@ -1246,6 +1247,7 @@ static void encoder_set_video(obs_encoder_t *encoder, video_t *video)
 		voi = video_output_get_info(video);
 		encoder->media = video;
 		encoder->game_clock = obs->video.game_clock_enabled && !obs->video.game_clock_retime;
+		encoder->retime_video = obs->video.game_clock_enabled && obs->video.game_clock_retime;
 		if (encoder->game_clock) {
 			/* game-clock output: real-time pts in 1/(fps_num * 1000),
 			 * 16.7 us at 60 fps; see video_frame_pts() */
@@ -1443,6 +1445,8 @@ void send_off_encoder_packet(obs_encoder_t *encoder, bool success, bool received
 
 		pthread_mutex_lock(&encoder->pause.mutex);
 		pkt->sys_dts_usec += encoder->pause.ts_offset / 1000;
+		if (encoder->retime_video || encoder->retime)
+			pkt->sys_dts_usec = retime_sys_dts_usec(encoder, pkt, pkt->sys_dts_usec);
 		pthread_mutex_unlock(&encoder->pause.mutex);
 
 		/* Find the encoder packet timing entry in the encoder
@@ -1967,10 +1971,11 @@ static void retime_reset(struct obs_encoder *encoder)
 {
 	if (encoder->retime_rs) {
 		blog(LOG_INFO,
-		     "'%s': retime: %" PRIu64 " samples in, %" PRIu64 " out, last trim %d samples/s, "
-		     "largest filtered lag %.1f ms",
-		     encoder->context.name, encoder->retime_in, encoder->retime_out, encoder->retime_delta,
-		     encoder->retime_max_drift * 1000.0);
+		     "'%s': retime: %" PRIu64 " samples in, %" PRIu64 " out, video rate %+.2f .. %+.2f %%, "
+		     "last trim %d samples/s, largest filtered lag %.1f ms",
+		     encoder->context.name, encoder->retime_in, encoder->retime_out,
+		     (encoder->retime_rate_min - 1.0) * 100.0, (encoder->retime_rate_max - 1.0) * 100.0,
+		     encoder->retime_delta, encoder->retime_max_drift * 1000.0);
 		audio_resampler_destroy(encoder->retime_rs);
 		encoder->retime_rs = NULL;
 	}
@@ -1980,6 +1985,92 @@ static void retime_reset(struct obs_encoder *encoder)
 	encoder->retime_drift = 0.0;
 	encoder->retime_max_drift = 0.0;
 	encoder->retime_delta = 0;
+	encoder->retime_rate_n = 0;
+	encoder->retime_rate = 1.0;
+	encoder->retime_rate_min = 1.0;
+	encoder->retime_rate_max = 1.0;
+	encoder->retime_rate_warned = false;
+}
+
+/* The rate of the video file time against real time, from one (time, file
+ * time) sample per second over the last RETIME_RATE_HIST seconds.  It is the
+ * trim's feed-forward: a 59.8 fps game needs 0.33 % of the audio removed
+ * whatever the lag is, and a controller that derives the whole trim from the
+ * lag has to hold a lag to do it (3.4 ms per 0.33 %) and saturates when the
+ * game runs more than its limit slow (58.5 fps: the audio ran 10 s long in 77
+ * minutes with a 1 % limit).  With the rate measured, the lag term only
+ * corrects the residual. */
+static void retime_rate_update(struct obs_encoder *encoder, uint64_t ts, double vtime)
+{
+	long n = encoder->retime_rate_n;
+	const struct retime_rate_mark *oldest;
+	double span, rate;
+
+	if (n) {
+		const struct retime_rate_mark *last = &encoder->retime_rate_hist[(n - 1) % RETIME_RATE_HIST];
+		if (ts < last->ts + 1000000000ULL)
+			return;
+	}
+	encoder->retime_rate_hist[n % RETIME_RATE_HIST].ts = ts;
+	encoder->retime_rate_hist[n % RETIME_RATE_HIST].vtime = vtime;
+	encoder->retime_rate_n = ++n;
+
+	oldest = &encoder->retime_rate_hist[(n > RETIME_RATE_HIST ? n - RETIME_RATE_HIST : 0) % RETIME_RATE_HIST];
+	span = (double)(ts - oldest->ts) * 1e-9;
+	if (span < 4.0)
+		return; /* the lag term alone for the first seconds */
+	rate = (vtime - oldest->vtime) / span;
+	if (rate < 0.5 || rate > 2.0)
+		return; /* not a rate: the history was reset or the clock jumped */
+	encoder->retime_rate = rate;
+	if (rate < encoder->retime_rate_min)
+		encoder->retime_rate_min = rate;
+	if (rate > encoder->retime_rate_max)
+		encoder->retime_rate_max = rate;
+	if (!encoder->retime_rate_warned && fabs(rate - 1.0) > 0.02) {
+		encoder->retime_rate_warned = true;
+		blog(LOG_WARNING,
+		     "'%s': retime: the video file time runs %+.2f %% against real time (the game %s than "
+		     "the output rate by more than 2 %%): the audio follows and its pitch moves with it; "
+		     "if that is not wanted, use the game-clock output without retiming for this game",
+		     encoder->context.name, (rate - 1.0) * 100.0, rate < 1.0 ? "slower" : "faster");
+	}
+}
+
+/* Retimed CFR: the file time runs at the game's rate, so the stock system
+ * dts (start time plus file time, plus the pauses) falls behind the clock by
+ * the retimed amount, 42 s after 77 minutes of a 58.5 fps game, and the
+ * outputs stop on a packet past the stop time, so the stop waited as long
+ * and the file got that much more.  The real time of a video packet is the
+ * timestamp of its frame (the marks, by dts, which is an earlier frame's pts
+ * with B-frames, else by pts); of an audio packet the stock value plus the
+ * samples trimmed so far.  Called with the pause mutex held. */
+static int64_t retime_sys_dts_usec(struct obs_encoder *encoder, const struct encoder_packet *pkt, int64_t sys)
+{
+	if (pkt->type == OBS_ENCODER_VIDEO) {
+		long n = os_atomic_load_long(&encoder->retime_hist_n);
+		long first = n > RETIME_HIST ? n - RETIME_HIST : 0;
+		const struct retime_mark *found = NULL;
+
+		for (long i = n - 1; i >= first && !found; i--) {
+			const struct retime_mark *m = &encoder->retime_hist[i % RETIME_HIST];
+			if (m->pts == pkt->dts)
+				found = m;
+		}
+		for (long i = n - 1; i >= first && !found; i--) {
+			const struct retime_mark *m = &encoder->retime_hist[i % RETIME_HIST];
+			if (m->pts == pkt->pts)
+				found = m;
+		}
+		if (found)
+			return (int64_t)((found->ts + encoder->pause.ts_offset) / 1000);
+		return sys;
+	}
+	if (pkt->type == OBS_ENCODER_AUDIO && encoder->samplerate && encoder->retime_in > encoder->retime_out)
+		return sys + (int64_t)((encoder->retime_in - encoder->retime_out) * 1000000 / encoder->samplerate);
+	if (pkt->type == OBS_ENCODER_AUDIO && encoder->samplerate && encoder->retime_out > encoder->retime_in)
+		return sys - (int64_t)((encoder->retime_out - encoder->retime_in) * 1000000 / encoder->samplerate);
+	return sys;
 }
 
 static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio)
@@ -2026,13 +2117,16 @@ static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio)
 		encoder->retime_drift += (drift - encoder->retime_drift) * 0.01;
 		if (fabs(encoder->retime_drift) > encoder->retime_max_drift)
 			encoder->retime_max_drift = fabs(encoder->retime_drift);
+		retime_rate_update(encoder, audio->timestamp, vtime);
 	} else {
 		drift = encoder->retime_drift; /* a gap in the video: keep the current trim */
 	}
 
-	/* add (remove) the filtered lag over the next second, at most one percent */
-	limit = (int)encoder->samplerate / 100;
-	delta = (int)lrint(encoder->retime_drift * (double)encoder->samplerate);
+	/* the trim: the measured rate of the video file time, plus the filtered
+	 * lag spread over the next two seconds; at most five percent (a game
+	 * below 57 fps is not a case for retiming) */
+	limit = (int)encoder->samplerate / 20;
+	delta = (int)lrint(((encoder->retime_rate - 1.0) + encoder->retime_drift / 2.0) * (double)encoder->samplerate);
 	if (delta > limit)
 		delta = limit;
 	else if (delta < -limit)
@@ -2050,8 +2144,11 @@ static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio)
 	encoder->retime_out += out_frames;
 	minute_after = encoder->retime_out / ((uint64_t)encoder->samplerate * 60);
 	if (minute_after != minute_before)
-		blog(LOG_INFO, "'%s': retime: %" PRIu64 " min, trim %d samples/s, filtered lag %.1f ms (raw %.1f ms)",
-		     encoder->context.name, minute_after, delta, encoder->retime_drift * 1000.0, drift * 1000.0);
+		blog(LOG_INFO,
+		     "'%s': retime: %" PRIu64 " min, video rate %+.2f %%, trim %d samples/s, filtered lag %.1f ms "
+		     "(raw %.1f ms)",
+		     encoder->context.name, minute_after, (encoder->retime_rate - 1.0) * 100.0, delta,
+		     encoder->retime_drift * 1000.0, drift * 1000.0);
 	for (size_t i = 0; i < MAX_AV_PLANES; i++)
 		audio->data[i] = output[i];
 	audio->frames = out_frames;

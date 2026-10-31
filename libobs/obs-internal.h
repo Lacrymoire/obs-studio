@@ -52,6 +52,7 @@
 #define NUM_ENCODE_TEXTURES 10
 #define NUM_ENCODE_TEXTURE_FRAMES_TO_WAIT 1
 #define RETIME_HIST 512 /* Phase 5b: video frames of (timestamp, pts) history, 8.5 s at 60 fps */
+#define RETIME_RATE_HIST 32 /* Phase 5b: one (time, video file time) sample per second for the rate */
 
 static inline int64_t packet_dts_usec(struct encoder_packet *packet)
 {
@@ -1441,6 +1442,9 @@ struct obs_encoder {
 	 * timebase is set; pts then come from frame timestamps (see
 	 * video_frame_pts), cur_pts stays the frame counter */
 	bool game_clock;
+	/* video encoders in retimed mode (paced ticks, frame-count pts): the
+	 * packets' system dts come from the frame timestamps (marks) */
+	bool retime_video;
 	/* Phase 5b retimed CFR, audio encoders: the audio is passed through a
 	 * same-rate resampler whose rate is trimmed so that the audio sent to
 	 * the encoder follows the paired video encoder's file time (see
@@ -1453,6 +1457,16 @@ struct obs_encoder {
 	double retime_drift;            /* filtered lag of the audio behind the video file time, s */
 	double retime_max_drift;
 	int retime_delta;               /* samples per second currently added (negative: removed) */
+	/* the rate of the video file time against real time, measured over the
+	 * last RETIME_RATE_HIST seconds (1 = real time; 0.9967 for a 59.8 fps
+	 * game): the trim's feed-forward, so that the lag has nothing to carry */
+	struct retime_rate_mark {
+		uint64_t ts;
+		double vtime;
+	} retime_rate_hist[RETIME_RATE_HIST];
+	long retime_rate_n;
+	double retime_rate, retime_rate_min, retime_rate_max;
+	bool retime_rate_warned;
 	/* video encoders: the (frame timestamp, pts) of the last RETIME_HIST
 	 * frames sent to the encoder, so that the audio can look up the file
 	 * time of its own timestamps (retime_file_time) instead of comparing
