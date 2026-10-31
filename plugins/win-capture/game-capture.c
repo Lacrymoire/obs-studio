@@ -158,6 +158,21 @@ struct game_capture_config {
  * by more than the window follows): the clock is refitted from scratch instead */
 #define LOCK_REANCHOR_BURST 3
 #define LOCK_REANCHOR_BURST_NS 1000000000ULL
+/* Phase 7: a game whose rate wanders (uncapped, GPU bound) has no clock to
+ * lock to: the fit lags the rate, the anchor shifts every few seconds and the
+ * cadence hops.  LOCK_WANDER_N clock shifts on a mature fit within
+ * LOCK_WANDER_WINDOW_NS, spanning LOCK_WANDER_SPAN_NS, with the period in use
+ * spread by LOCK_WANDER_SPREAD across them, switch the choice to the present
+ * times themselves with no cadence (lock_select_raw); LOCK_WANDER_CALM_NS
+ * without a shift switches back.  A period step of LOCK_WANDER_STEP on a
+ * mature fit (menu to game) forgets the shifts before it. */
+#define LOCK_WANDER_N 3
+#define LOCK_WANDER_MAX 8
+#define LOCK_WANDER_WINDOW_NS 15000000000ULL
+#define LOCK_WANDER_SPAN_NS 5000000000ULL
+#define LOCK_WANDER_CALM_NS 20000000000ULL
+#define LOCK_WANDER_SPREAD 0.02
+#define LOCK_WANDER_STEP 0.20
 /* Phase 6 cadence (see cadence_choose): m output ticks per n game frames */
 #define CADENCE_BAND 0.02      /* residual (paced tick rate / output rate - 1) a cadence may have to be chosen */
 #define CADENCE_KEEP 0.03      /* residual the current cadence may drift to before it is re-chosen */
@@ -309,6 +324,15 @@ struct game_capture {
 		struct {
 			uint64_t counter, v;
 		} vlog[PRESENT_LOG_SIZE]; /* slot of each present the ring read, by counter */
+		/* Phase 7 wandering rate (lock_wandering): the clock shifts on a
+		 * mature fit within the window, with the period in use at each */
+		uint64_t wander_times[LOCK_WANDER_MAX];
+		double wander_periods[LOCK_WANDER_MAX];
+		uint32_t wander_n;
+		bool wander;             /* the rate wanders: no cadence, frames chosen by their present times */
+		uint64_t wander_last_ns; /* the last shift counted */
+		double wander_ref_ns;    /* period of the last mature fit (a step from it clears the shifts) */
+		uint64_t wander_ticks, wander_entries;
 	} lock;
 
 	/* frame-locked capture: Phase 1 debug log state (see flog_tick) */
@@ -324,7 +348,7 @@ struct game_capture {
 		bool waiting_logged;
 		bool blocked_logged;
 		/* lock counters when the log opened, so the close line reports this recording only */
-		uint64_t repeats0, skips0, starved0, lagged0, resets0, reanchors0, misses0;
+		uint64_t repeats0, skips0, starved0, lagged0, resets0, reanchors0, misses0, wander_ticks0;
 	} flog;
 
 	PFN_SetThreadDpiAwarenessContext set_thread_dpi_awareness_context;
@@ -487,8 +511,8 @@ static void lock_reset(struct game_capture *gc, const char *why)
 	gc->lock.jitter_n = 0;
 	gc->lock.fresh = true;
 	gc->lock.carried = false;
-	if (why && gc->config.frame_log)
-		info("frame lock: refit (%s)", why);
+	if (why && gc->config.frame_log && !gc->lock.wander)
+		info("frame lock: refit (%s)", why); /* (Phase 7: not while the rate wanders: one every few seconds) */
 }
 
 /* a new hook (ring_open): the window, the pending points and the frame on
@@ -505,8 +529,18 @@ static void lock_reopen(struct game_capture *gc)
 	const uint64_t vfr_frames = gc->lock.vfr_frames, vfr_paced = gc->lock.vfr_paced,
 		       vfr_starved = gc->lock.vfr_starved, vfr_repeats = gc->lock.vfr_repeats,
 		       cad_changes = gc->lock.cad_changes;
+	/* Phase 7: the same game is still the same game: whether its rate
+	 * wanders is kept (the shifts seen so far are not: they belong to the
+	 * old counter space) */
+	const bool wander = gc->lock.wander;
+	const uint64_t wander_last_ns = gc->lock.wander_last_ns, wander_ticks = gc->lock.wander_ticks,
+		       wander_entries = gc->lock.wander_entries;
 
 	memset(&gc->lock, 0, sizeof(gc->lock));
+	gc->lock.wander = wander;
+	gc->lock.wander_last_ns = wander_last_ns;
+	gc->lock.wander_ticks = wander_ticks;
+	gc->lock.wander_entries = wander_entries;
 	gc->lock.cad_changes = cad_changes;
 	gc->lock.vfr_frames = vfr_frames;
 	gc->lock.vfr_paced = vfr_paced;
@@ -620,6 +654,79 @@ static inline double lock_scale(const struct game_capture *gc)
 	return gc->lock.period_ns > interval ? gc->lock.period_ns : interval;
 }
 
+/* Phase 7: a clock shift on a mature fit is evidence of a wandering rate
+ * (lock_wandering); one on a fresh fit (a loading screen, a cold start, the
+ * second of a burst) says nothing about the rate */
+static void lock_wander_event(struct game_capture *gc, uint64_t time_ns)
+{
+	if (gc->lock.fresh)
+		return;
+	if (gc->lock.wander_n == LOCK_WANDER_MAX) {
+		memmove(&gc->lock.wander_times[0], &gc->lock.wander_times[1],
+			(LOCK_WANDER_MAX - 1) * sizeof(gc->lock.wander_times[0]));
+		memmove(&gc->lock.wander_periods[0], &gc->lock.wander_periods[1],
+			(LOCK_WANDER_MAX - 1) * sizeof(gc->lock.wander_periods[0]));
+		gc->lock.wander_n--;
+	}
+	gc->lock.wander_times[gc->lock.wander_n] = time_ns;
+	gc->lock.wander_periods[gc->lock.wander_n] = gc->lock.period_ns;
+	gc->lock.wander_n++;
+	gc->lock.wander_last_ns = time_ns;
+}
+
+/* Phase 7: once per tick.  Enters wander mode on LOCK_WANDER_N shifts within
+ * the window that span LOCK_WANDER_SPAN_NS with the period in use spread by
+ * LOCK_WANDER_SPREAD across them (a pinned rate with hitches shifts with the
+ * same period every time, a wandering one with a different period); leaves it
+ * after LOCK_WANDER_CALM_NS without a shift.  Returns the mode. */
+static bool lock_wandering(struct game_capture *gc, uint64_t now_ns)
+{
+	uint32_t drop = 0;
+
+	while (drop < gc->lock.wander_n &&
+	       (int64_t)(now_ns - gc->lock.wander_times[drop]) > (int64_t)LOCK_WANDER_WINDOW_NS)
+		drop++;
+	if (drop) {
+		gc->lock.wander_n -= drop;
+		memmove(&gc->lock.wander_times[0], &gc->lock.wander_times[drop],
+			gc->lock.wander_n * sizeof(gc->lock.wander_times[0]));
+		memmove(&gc->lock.wander_periods[0], &gc->lock.wander_periods[drop],
+			gc->lock.wander_n * sizeof(gc->lock.wander_periods[0]));
+	}
+
+	if (!gc->lock.wander) {
+		const uint32_t n = gc->lock.wander_n;
+
+		if (n >= LOCK_WANDER_N &&
+		    gc->lock.wander_times[n - 1] - gc->lock.wander_times[0] >= LOCK_WANDER_SPAN_NS) {
+			double lo = gc->lock.wander_periods[0], hi = lo;
+
+			for (uint32_t i = 1; i < n; i++) {
+				if (gc->lock.wander_periods[i] < lo)
+					lo = gc->lock.wander_periods[i];
+				if (gc->lock.wander_periods[i] > hi)
+					hi = gc->lock.wander_periods[i];
+			}
+			if (hi - lo >= LOCK_WANDER_SPREAD * lo) {
+				gc->lock.wander = true;
+				gc->lock.wander_entries++;
+				info("frame lock: the game's rate wanders (%" PRIu32
+				     " clock shifts in %.1f s, period %.2f-%.2f ms); cadence off, frames chosen by their "
+				     "present times",
+				     n, (double)(gc->lock.wander_times[n - 1] - gc->lock.wander_times[0]) / 1e9,
+				     lo / 1000000.0, hi / 1000000.0);
+			}
+		}
+	} else if ((int64_t)(now_ns - gc->lock.wander_last_ns) >= (int64_t)LOCK_WANDER_CALM_NS) {
+		gc->lock.wander = false;
+		gc->lock.wander_n = 0;
+		info("frame lock: the game's rate is steady again (%.0f s without a clock shift, %.2f fps); back to "
+		     "the fitted clock",
+		     LOCK_WANDER_CALM_NS / 1e9, 1e9 / gc->lock.period_ns);
+	}
+	return gc->lock.wander;
+}
+
 /* the clock moved: keep its period, start the window again from this record */
 static void lock_reanchor(struct game_capture *gc, uint64_t counter, uint64_t time_ns, const char *why, bool new_space)
 {
@@ -651,7 +758,7 @@ static void lock_reanchor(struct game_capture *gc, uint64_t counter, uint64_t ti
 		gc->lock.active = false;
 		gc->lock.shown = 0;
 	}
-	if (gc->config.frame_log)
+	if (gc->config.frame_log && !gc->lock.wander)
 		info("frame lock: re-anchor (%s)", why);
 }
 
@@ -757,6 +864,7 @@ static uint64_t lock_add(struct game_capture *gc, uint64_t counter, uint64_t tim
 				const double off = (((double)t1 - lock_time_of(gc, c1)) + ((double)t2 - lock_time_of(gc, c2))) / 2.0;
 
 				if (fabs(off) > LOCK_SHIFT * lock_scale(gc)) {
+					lock_wander_event(gc, t1);
 					lock_reanchor(gc, c1, t1, "clock shifted", false);
 				} else {
 					/* a hitch the game caught up from: the line stands */
@@ -849,20 +957,26 @@ static void lock_fit(struct game_capture *gc)
 	gc->lock.carried = false;
 	/* mature: a window spanning a second, or a full one (a fast game fills
 	 * it sooner) */
-	if (gc->lock.ready && (gc->lock.span_ns >= LOCK_ENGAGE_SPAN_NS || n >= LOCK_FIT_N))
+	if (gc->lock.ready && (gc->lock.span_ns >= LOCK_ENGAGE_SPAN_NS || n >= LOCK_FIT_N)) {
 		gc->lock.fresh = false;
+		/* Phase 7: a period step from the last mature fit (a menu to the
+		 * game) starts a new rate regime; the shifts before it say
+		 * nothing about this one */
+		if (!gc->lock.wander && gc->lock.wander_ref_ns > 0.0 &&
+		    fabs(gc->lock.period_ns - gc->lock.wander_ref_ns) > LOCK_WANDER_STEP * gc->lock.wander_ref_ns)
+			gc->lock.wander_n = 0;
+		gc->lock.wander_ref_ns = gc->lock.period_ns;
+	}
 }
 
-/* chooses the frame counter to show at nominal tick time tick_ns; newest is the
- * newest copied frame, oldest the oldest one that is safe to switch to (the
- * hook may be writing the slot of the frame before it) */
-static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t newest, uint64_t oldest)
+/* the buffer delay this tick.  Phase 6: the ring holds ring - 2 safe frames;
+ * at a high game rate the delay would reach past them, so it is shortened to
+ * what the ring holds (the video is then that much less delayed for this
+ * game) */
+static uint64_t lock_delay(struct game_capture *gc)
 {
 	uint64_t delay_ns = (uint64_t)gc->config.buffer_delay * obs_get_frame_interval_ns();
-	double target;
-	/* Phase 6: the ring holds ring - 2 safe frames; at a high game rate the
-	 * delay would reach past them, so it is shortened to what the ring holds
-	 * (the video is then that much less delayed for this game) */
+
 	if (gc->ring.size >= 4) {
 		const double fit = (double)(gc->ring.size - 3) * gc->lock.period_ns;
 		if ((double)delay_ns > fit) {
@@ -877,6 +991,72 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 		}
 	}
 	gc->lock.delay_ns = delay_ns;
+	return delay_ns;
+}
+
+/* Phase 7: the choice while the rate wanders (lock_wandering): the newest
+ * present at or before the target time, by the present times themselves; no
+ * fitted clock, no cadence (an uncapped game has no clock to follow, and the
+ * fit would only lag it).  Never a step back; within the ring. */
+static uint64_t lock_select_raw(struct game_capture *gc, uint64_t tick_ns, uint64_t newest, uint64_t oldest)
+{
+	const volatile struct shtex_data *shtex = gc->shtex_data;
+	const uint64_t delay_ns = lock_delay(gc);
+	const uint64_t target = tick_ns - delay_ns;
+	const bool was_active = gc->lock.active;
+	const uint64_t prev_c = was_active ? gc->lock.shown : gc->ring.shown_counter;
+	uint64_t c, time_ns = 0;
+
+	gc->lock.starved_now = false;
+
+	/* the newest present at or before the target; the log holds the last
+	 * PRESENT_LOG_SIZE presents, far more than the ring */
+	for (c = newest; c > oldest; c--) {
+		const volatile struct present_record *rec = &shtex->present_log[(c - 1) % PRESENT_LOG_SIZE];
+
+		if (rec->counter == c && rec->time_ns <= target)
+			break;
+	}
+	{
+		const volatile struct present_record *rec = &shtex->present_log[(c - 1) % PRESENT_LOG_SIZE];
+
+		if (rec->counter == c)
+			time_ns = rec->time_ns;
+	}
+	if (c == newest && time_ns && target - time_ns > (uint64_t)gc->lock.period_ns) {
+		/* the frame due is not presented yet: the game stalled */
+		gc->lock.starved++;
+		gc->lock.starved_now = true;
+	}
+	if (c < prev_c && prev_c <= newest)
+		c = prev_c; /* (prev_c > newest: the counters restarted) */
+	if (c < oldest && c != prev_c) {
+		c = oldest;
+		gc->lock.lagged++;
+	}
+	if (prev_c) {
+		if (c == prev_c)
+			gc->lock.repeats++;
+		else if (c > prev_c + 1)
+			gc->lock.skips++;
+	}
+
+	gc->lock.active = true;
+	gc->lock.shown = c;
+	gc->lock.shown_v = lock_v_of(gc, c);
+	gc->lock.pos = 0.0;
+	gc->lock.smooth_ns = time_ns ? (double)time_ns : lock_time_of(gc, gc->lock.shown_v);
+	return c;
+}
+
+/* chooses the frame counter to show at nominal tick time tick_ns; newest is the
+ * newest copied frame, oldest the oldest one that is safe to switch to (the
+ * hook may be writing the slot of the frame before it) */
+static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t newest, uint64_t oldest)
+{
+	const uint64_t delay_ns = lock_delay(gc);
+	double target;
+
 	target = (double)(int64_t)(tick_ns - delay_ns);
 	/* Phase 6: the timeline runs over grid slots (lock_add); the choice is
 	 * made in slots and mapped back to the newest present at or before the
@@ -1111,7 +1291,8 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 	const bool skip = false;
 	bool vfr = false;
 
-	if (gc->config.buffering && gc->lock.ready && gc->lock.active && obs_get_game_clock_enabled()) {
+	if (gc->config.buffering && gc->lock.ready && gc->lock.active && !gc->lock.wander &&
+	    obs_get_game_clock_enabled()) {
 		const uint64_t interval = obs_get_frame_interval_ns();
 		const double r = gc->lock.period_ns / (double)interval; /* output ticks per game frame */
 		const uint64_t now = os_gettime_ns();
@@ -1265,7 +1446,13 @@ static void ring_tick(struct game_capture *gc)
 		const uint64_t oldest = count > keep ? count - keep : 1;
 		uint64_t c = count;
 
-		if (gc->config.buffering && gc->lock.ready) {
+		if (gc->config.buffering && (gc->lock.ready || gc->lock.wander) && lock_wandering(gc, os_gettime_ns())) {
+			/* Phase 7: the game's rate wanders: the frame due by the
+			 * present times alone (through the lock's refits too: the
+			 * choice needs no fit) */
+			c = lock_select_raw(gc, obs_get_video_frame_time(), count, oldest);
+			gc->lock.wander_ticks++;
+		} else if (gc->config.buffering && gc->lock.ready) {
 			/* Phase 3 choice: the frame the game's timeline puts at this
 			 * tick, delay frames back */
 			c = lock_select(gc, obs_get_video_frame_time(), count, oldest);
@@ -1347,12 +1534,14 @@ static void flog_close(struct game_capture *gc, const char *reason)
 		fclose(gc->flog.file);
 		gc->flog.file = NULL;
 		info("frame log closed (%s): %s, %" PRIu64 " ticks, %" PRIu64 " lost log entries; frame lock: %" PRIu64
-		     " repeats, %" PRIu64 " skips, %" PRIu64 " starved, %" PRIu64 " lagged, %" PRIu64 " refits, %" PRIu64
-		     " re-anchors, %" PRIu64 " slots the game skipped",
+		     " repeats, %" PRIu64 " skips, %" PRIu64 " starved, %" PRIu64 " lagged, %" PRIu64
+		     " refits, %" PRIu64 " re-anchors, %" PRIu64 " slots the game skipped, %" PRIu64
+		     " ticks on present times (rate wandering)",
 		     reason, gc->flog.path, gc->flog.ticks, gc->flog.lost, gc->lock.repeats - gc->flog.repeats0,
 		     gc->lock.skips - gc->flog.skips0, gc->lock.starved - gc->flog.starved0,
 		     gc->lock.lagged - gc->flog.lagged0, gc->lock.resets - gc->flog.resets0,
-		     gc->lock.reanchors - gc->flog.reanchors0, gc->lock.misses - gc->flog.misses0);
+		     gc->lock.reanchors - gc->flog.reanchors0, gc->lock.misses - gc->flog.misses0,
+		     gc->lock.wander_ticks - gc->flog.wander_ticks0);
 	}
 
 	if (gc->flog.output) {
@@ -1431,6 +1620,7 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 	gc->flog.resets0 = gc->lock.resets;
 	gc->flog.reanchors0 = gc->lock.reanchors;
 	gc->flog.misses0 = gc->lock.misses;
+	gc->flog.wander_ticks0 = gc->lock.wander_ticks;
 
 	obs_get_video_info(&ovi);
 	fprintf(gc->flog.file, "# obs-frame-lock log v3\n");
@@ -1595,6 +1785,8 @@ static void flog_tick(struct game_capture *gc)
 	if (gc->lock.vfr_now)
 		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%sgc %" PRIu32 "/%" PRIu32, note[0] ? " " : "",
 			 gc->lock.cad_m, gc->lock.cad_n);
+	if (gc->ring.size && gc->lock.wander && gc->lock.active)
+		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%sraw", note[0] ? " " : "");
 	if (gc->flog.lost || gc->ring.lost)
 		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%slost=%" PRIu64 "/%" PRIu64,
 			 note[0] ? " " : "", gc->flog.lost, gc->ring.lost);
