@@ -258,6 +258,7 @@ struct game_capture {
 		/* Phase 5 game-clock output (see game_clock_tick) */
 		bool vfr;                /* engaged: the game is the slower clock */
 		bool vfr_now;            /* this tick's frame carries a game-clock stamp */
+		bool retime_refused;     /* retimed mode: the game is too slow for it (logged once) */
 		uint64_t vfr_frames, vfr_paced, vfr_starved, vfr_repeats;
 	} lock;
 
@@ -798,6 +799,27 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 		const uint64_t c = gc->lock.shown;
 
 		vfr = gc->lock.period_ns >= 0.9 * (double)interval;
+		if (vfr && obs_get_game_clock_retime()) {
+			/* retimed CFR: the file runs at the game's rate and the audio
+			 * is trimmed to follow, by at most 5 % (obs-encoder.c).  A game
+			 * slower than that, a 30 or 45 fps game under a 60 fps output,
+			 * is left to the stock constant frame rate, which repeats its
+			 * frames and keeps the audio in real time.  Engages again (with
+			 * a little hysteresis) once the game is back within the band. */
+			const double limit = gc->lock.vfr ? 1.06 : 1.05;
+
+			if (gc->lock.period_ns > limit * (double)interval) {
+				vfr = false;
+				if (!gc->lock.retime_refused) {
+					info("game-clock output: retime not engaged, the game runs %.1f %% slower than "
+					     "the output rate (limit 5 %%); constant frame rate for this source",
+					     (gc->lock.period_ns / (double)interval - 1.0) * 100.0);
+					gc->lock.retime_refused = true;
+				}
+			} else {
+				gc->lock.retime_refused = false;
+			}
+		}
 		if (vfr) {
 			if (gc->lock.starved_now) {
 				gc->lock.vfr_starved++;
