@@ -414,6 +414,17 @@ struct obs_core_video {
 	uint32_t lagged_frames;
 	bool thread_initialized;
 
+	/* Frame-locked capture, game-clock output (Phase 5).  The clock-master
+	 * source sets the per-tick fields from its video_tick (video thread);
+	 * video_sleep consumes and clears them on the same thread. */
+	volatile bool game_clock_enabled; /* user setting: real-time pts, paced ticks */
+	uint64_t game_clock_frame_ts;     /* timestamp of the frame rendered this tick (0 = tick time) */
+	uint64_t game_clock_next_tick;    /* wall time the next tick should run at (0 = nominal) */
+	bool game_clock_skip;             /* this tick's frame is a repeat: do not encode it */
+	uint64_t game_clock_last_ts;      /* monotonic guard for the frame timestamps */
+	uint32_t game_clock_skipped;      /* frames not queued to the encoders */
+	uint32_t game_clock_paced;        /* ticks whose time the master source chose */
+
 	gs_texture_t *transparent_texture;
 
 	gs_effect_t *deinterlace_discard_effect;
@@ -1423,6 +1434,10 @@ struct obs_encoder {
 	uint32_t roi_increment;
 
 	int64_t cur_pts;
+	/* frame-locked capture, game-clock output: latched when the video
+	 * timebase is set; pts then come from frame timestamps (see
+	 * video_frame_pts), cur_pts stays the frame counter */
+	bool game_clock;
 
 	struct deque audio_input_buffer[MAX_AV_PLANES];
 	uint8_t *audio_output_buffer[MAX_AV_PLANES];
@@ -1478,6 +1493,7 @@ extern bool start_gpu_encode(obs_encoder_t *encoder);
 extern void stop_gpu_encode(obs_encoder_t *encoder);
 
 extern bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame, const uint64_t *frame_cts);
+extern int64_t video_frame_pts(struct obs_encoder *encoder, uint64_t timestamp);
 extern void send_off_encoder_packet(obs_encoder_t *encoder, bool success, bool received, struct encoder_packet *pkt);
 
 void obs_encoder_destroy(obs_encoder_t *encoder);

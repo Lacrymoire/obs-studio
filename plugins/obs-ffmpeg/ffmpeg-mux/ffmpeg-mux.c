@@ -89,6 +89,8 @@ struct main_params {
 	int height;
 	int fps_num;
 	int fps_den;
+	int timebase_num; /* packet timebase of the video encoder (0 = fps) */
+	int timebase_den;
 	int color_primaries;
 	int color_trc;
 	int colorspace;
@@ -384,6 +386,11 @@ static bool init_params(int *argc, char ***argv, struct main_params *params, str
 			return false;
 		if (!get_opt_int(argc, argv, &params->codec_tag, "video codec tag"))
 			params->codec_tag = 0;
+		if (!get_opt_int(argc, argv, &params->timebase_num, "video timebase num") ||
+		    !get_opt_int(argc, argv, &params->timebase_den, "video timebase den")) {
+			params->timebase_num = 0;
+			params->timebase_den = 0;
+		}
 	}
 
 	if (params->tracks) {
@@ -464,9 +471,13 @@ static void create_video_stream(struct ffmpeg_mux *ffm)
 	context->extradata = extradata;
 	context->extradata_size = ffm->video_header.size;
 	context->time_base = (AVRational){ffm->params.fps_den, ffm->params.fps_num};
+	if (ffm->params.timebase_num > 0 && ffm->params.timebase_den > 0) {
+		/* game-clock output: the encoder's own (finer) packet timebase */
+		context->time_base = (AVRational){ffm->params.timebase_num, ffm->params.timebase_den};
+	}
 
 	ffm->video_stream->time_base = context->time_base;
-	ffm->video_stream->avg_frame_rate = av_inv_q(context->time_base);
+	ffm->video_stream->avg_frame_rate = (AVRational){ffm->params.fps_num, ffm->params.fps_den};
 
 	if (ffm->output->oformat->flags & AVFMT_GLOBALHEADER)
 		context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;

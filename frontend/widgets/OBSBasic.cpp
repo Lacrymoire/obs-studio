@@ -1450,6 +1450,11 @@ int OBSBasic::ResetVideo()
 
 	GetConfigFPS(ovi.fps_num, ovi.fps_den);
 
+	/* frame-locked capture, game-clock output (Phase 5): basic.ini
+	 * [Video] GameClockOutput=true; applied here so that it is set before
+	 * any output or encoder is created */
+	obs_set_game_clock_enabled(config_get_bool(activeConfiguration, "Video", "GameClockOutput"));
+
 	const char *colorFormat = config_get_string(activeConfiguration, "Video", "ColorFormat");
 	const char *colorSpace = config_get_string(activeConfiguration, "Video", "ColorSpace");
 	const char *colorRange = config_get_string(activeConfiguration, "Video", "ColorRange");

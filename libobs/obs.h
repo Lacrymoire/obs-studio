@@ -935,6 +935,18 @@ EXPORT void obs_remove_raw_audio_callback(size_t mix_idx, audio_output_callback_
 
 EXPORT uint64_t obs_get_video_frame_time(void);
 
+/* Frame-locked capture, game-clock output (Phase 5).  When enabled, video
+ * packets carry real-time presentation timestamps in a 1/(fps_num * 1000)
+ * timebase instead of a frame count, and the clock-master source may pace the
+ * video thread.  A source calls obs_video_set_game_clock_tick() from its
+ * video_tick with the timestamp of the frame it chose for this tick (0 = the
+ * tick's own time), the wall time at which the next tick should run (0 = the
+ * nominal interval) and whether this tick's frame is a repeat that must not be
+ * encoded.  Ignored while game-clock output is disabled. */
+EXPORT void obs_set_game_clock_enabled(bool enabled);
+EXPORT bool obs_get_game_clock_enabled(void);
+EXPORT void obs_video_set_game_clock_tick(uint64_t frame_ts_ns, uint64_t next_tick_ns, bool skip);
+
 EXPORT double obs_get_active_fps(void);
 EXPORT uint64_t obs_get_average_frame_time_ns(void);
 EXPORT uint64_t obs_get_frame_interval_ns(void);
@@ -2372,6 +2384,9 @@ EXPORT enum obs_scale_type obs_encoder_get_scale_type(obs_encoder_t *encoder);
 
 /** For video encoders, returns the frame rate divisor (default is 1) */
 EXPORT uint32_t obs_encoder_get_frame_rate_divisor(const obs_encoder_t *encoder);
+
+/** Packet timebase of a video encoder (frame-locked capture, game-clock output) */
+EXPORT void obs_encoder_get_timebase(const obs_encoder_t *encoder, uint32_t *num, uint32_t *den);
 
 /** For video encoders, returns the number of frames encoded */
 EXPORT uint32_t obs_encoder_get_encoded_frames(const obs_encoder_t *encoder);

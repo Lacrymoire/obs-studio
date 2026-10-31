@@ -82,6 +82,9 @@ struct nvenc_data {
 	DARRAY(struct nv_cuda_surface) surfaces;
 	NV_ENC_BUFFER_FORMAT surface_format;
 	struct deque dts_list;
+	/* frame-locked capture (game-clock output): dts queue seeded with the
+	 * B-frame delay so that VFR input gets dts <= pts (see nvenc_encode_base) */
+	bool dts_seeded;
 
 	DARRAY(uint8_t) packet_data;
 	int64_t packet_pts;

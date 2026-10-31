@@ -254,6 +254,11 @@ struct game_capture {
 		double pos;              /* position of the chosen frame within its tick window */
 		double smooth_ns;        /* smoothed present time of the shown frame */
 		uint64_t repeats, skips, starved, lagged;
+		bool starved_now;        /* this tick's choice was clamped to the newest frame */
+		/* Phase 5 game-clock output (see game_clock_tick) */
+		bool vfr;                /* engaged: the game is the slower clock */
+		bool vfr_now;            /* this tick's frame carries a game-clock stamp */
+		uint64_t vfr_frames, vfr_paced, vfr_starved, vfr_repeats;
 	} lock;
 
 	/* frame-locked capture: Phase 1 debug log state (see flog_tick) */
@@ -444,7 +449,14 @@ static void lock_reopen(struct game_capture *gc)
 	const double period_ns = gc->lock.period_ns;
 	const bool ready = gc->lock.ready;
 
+	const uint64_t vfr_frames = gc->lock.vfr_frames, vfr_paced = gc->lock.vfr_paced,
+		       vfr_starved = gc->lock.vfr_starved, vfr_repeats = gc->lock.vfr_repeats;
+
 	memset(&gc->lock, 0, sizeof(gc->lock));
+	gc->lock.vfr_frames = vfr_frames;
+	gc->lock.vfr_paced = vfr_paced;
+	gc->lock.vfr_starved = vfr_starved;
+	gc->lock.vfr_repeats = vfr_repeats;
 	gc->lock.repeats = repeats;
 	gc->lock.skips = skips;
 	gc->lock.starved = starved;
@@ -638,6 +650,8 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 	const uint64_t prev = was_active ? gc->lock.shown : gc->ring.shown_counter;
 	uint64_t c;
 
+	gc->lock.starved_now = false;
+
 	if (!was_active) {
 		/* first choice on this clock: the frame due at the target time, but
 		 * never a step back from the frame already on screen (after a refit
@@ -656,15 +670,16 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 			c = prev; /* the next frame is not due yet: repeat */
 		else if (e >= 2.0 + LOCK_HYSTERESIS)
 			c = (uint64_t)x; /* far behind (the game paused and resumed): resync */
-		else if (e >= 1.0 + LOCK_HYSTERESIS)
+		else if (e >= 1.0 + LOCK_HYSTERESIS && !gc->lock.vfr)
 			c = next + 1; /* the frame after next is due as well: skip one */
 		else
-			c = next;
+			c = next; /* (game-clock output never skips: the paced ticks catch up) */
 	}
 
 	if (c > newest) {
 		c = newest; /* the game has not presented it yet */
 		gc->lock.starved++;
+		gc->lock.starved_now = true;
 	}
 	if (c < oldest && c != prev) {
 		/* switching to a frame whose slot the hook may be rewriting; the
@@ -748,6 +763,69 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 	return true;
 }
 
+/* Frame-locked capture, Phase 5: game-clock output.
+ *
+ * Called once per tick after the frame for this tick was chosen.  While the
+ * smoothed clock is trusted and the game is the slower clock (its period at
+ * least 0.9 of the tick interval, the rate-floor regime in which CFR has to
+ * repeat a frame for every frame the game did not make):
+ *   - a frame's deadline is the tick it is meant to be shown at: its smoothed
+ *     present time + (delay + 0.5) tick intervals, half a frame into its
+ *     window so that lock_select sees it at pos 0.5 with hysteresis on both
+ *     sides.  The next video tick is asked for at the next frame's deadline,
+ *     so one tick consumes one game frame; the encoder turns the deadline
+ *     into the frame's pts, so the file runs at the game's own rate and the
+ *     stamps sit where the tick times would be (the audio sync offset keeps
+ *     its meaning);
+ *   - while the game is stalled (this tick was starved) the nominal tick runs
+ *     and the repeated frame is stamped with the tick time, so the stall is
+ *     a run of ordinary repeats as in CFR.  Repeats are always encoded: the
+ *     muxer only releases audio behind the newest video packet and NVENC
+ *     holds the last B-frames until later frames arrive, so a tick without a
+ *     frame would stall both for the length of a loading screen.
+ * A faster game keeps CFR: when the game oversamples the recording a regular
+ * cadence is right and VFR would only carry sampling jitter into the file.
+ * Everything here is ignored by libobs unless game-clock output is enabled. */
+static void game_clock_tick(struct game_capture *gc, bool repeat)
+{
+	uint64_t frame_ts = 0, next_tick = 0;
+	const bool skip = false;
+	bool vfr = false;
+
+	if (gc->config.buffering && gc->lock.ready && gc->lock.active && obs_get_game_clock_enabled()) {
+		const uint64_t interval = obs_get_frame_interval_ns();
+		const double offset_ns = ((double)gc->config.buffer_delay + 0.5) * (double)interval;
+		const uint64_t c = gc->lock.shown;
+
+		vfr = gc->lock.period_ns >= 0.9 * (double)interval;
+		if (vfr) {
+			if (gc->lock.starved_now) {
+				gc->lock.vfr_starved++;
+			} else {
+				frame_ts = (uint64_t)(lock_time_of(gc, c) + offset_ns);
+				next_tick = (uint64_t)(lock_time_of(gc, c + 1) + offset_ns);
+				gc->lock.vfr_paced++;
+			}
+			gc->lock.vfr_frames++;
+			if (repeat)
+				gc->lock.vfr_repeats++;
+		}
+	}
+
+	if (vfr != gc->lock.vfr) {
+		if (vfr)
+			info("game-clock output: engaged (game period %.3f ms, tick %.3f ms)",
+			     gc->lock.period_ns / 1000000.0, obs_get_frame_interval_ns() / 1000000.0);
+		else
+			info("game-clock output: released (%" PRIu64 " ticks, %" PRIu64 " paced, %" PRIu64
+			     " starved, %" PRIu64 " repeats)",
+			     gc->lock.vfr_frames, gc->lock.vfr_paced, gc->lock.vfr_starved, gc->lock.vfr_repeats);
+		gc->lock.vfr = vfr;
+	}
+	gc->lock.vfr_now = vfr && !gc->lock.starved_now;
+	obs_video_set_game_clock_tick(frame_ts, next_tick, skip);
+}
+
 static void ring_tick(struct game_capture *gc)
 {
 	volatile struct shtex_data *shtex = gc->shtex_data;
@@ -814,8 +892,11 @@ static void ring_tick(struct game_capture *gc)
 			rec = &shtex->present_log[(count - 1) % PRESENT_LOG_SIZE];
 	}
 
-	if (rec->counter == gc->ring.shown_counter)
-		return; /* same frame as last tick: nothing to switch */
+	if (rec->counter == gc->ring.shown_counter) {
+		/* same frame as last tick: nothing to switch */
+		game_clock_tick(gc, true);
+		return;
+	}
 	if (rec->slot < gc->ring.size) {
 		gc->ring.shown_slot = rec->slot;
 		gc->ring.shown_counter = rec->counter;
@@ -823,6 +904,7 @@ static void ring_tick(struct game_capture *gc)
 		gc->texture = gc->ring.textures[rec->slot];
 		shtex->read_slot = rec->slot;
 	}
+	game_clock_tick(gc, false);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -957,17 +1039,18 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 	fprintf(gc->flog.file,
 		"# obs=%s fps=%" PRIu32 "/%" PRIu32 " base=%" PRIu32 "x%" PRIu32 " output=%" PRIu32 "x%" PRIu32
 		" capture=%" PRIu32 "x%" PRIu32 " ring=%" PRIu32 " buffering=%s delay=%" PRIu32
-		" source=%s recording=%s\n",
+		" gameclock=%s source=%s recording=%s\n",
 		obs_get_version_string(), ovi.fps_num, ovi.fps_den, ovi.base_width, ovi.base_height,
 		ovi.output_width, ovi.output_height, gc->cx, gc->cy, gc->ring.size,
 		gc->config.buffering && gc->ring.size ? "on" : "off", gc->config.buffer_delay,
-		obs_source_get_name(gc->source), rec.array);
+		obs_get_game_clock_enabled() ? "on" : "off", obs_source_get_name(gc->source), rec.array);
 	fprintf(gc->flog.file,
 		"# present: one row per frame the hook copied (counter, present time, ring slot)\n"
 		"# tick: one row per OBS video tick: nominal tick time, wall time, the frame shown (counter, present\n"
 		"#       time, slot), recording frame count, counter change since the previous tick (1 normal,\n"
 		"#       0 repeat, 2+ skip), the hook's running count of slot conflicts, and with buffering the\n"
-		"#       smoothed present time of the shown frame and its position on the timeline (frames)\n"
+		"#       smoothed present time of the shown frame and its position on the timeline (frames);\n"
+		"#       note 'gc' = game-clock stamp (smoothed time + (delay+0.5) ticks), 'paused' = not recorded\n"
 		"# all *_ns values are os_gettime_ns() (QueryPerformanceCounter) nanoseconds\n");
 	fprintf(gc->flog.file,
 		"kind,tick_ns,now_ns,counter,present_ns,out_frames,delta,note,slot,conflicts,smooth_ns,pos\n");
@@ -1091,8 +1174,15 @@ static void flog_tick(struct game_capture *gc)
 	}
 	delta = (int64_t)(shown - gc->flog.last_counter);
 	note[0] = 0;
+	/* an active output stays active while paused; the ticks of a pause are
+	 * not in the recording, so mark them for the analysis */
+	if (obs_output_paused(output))
+		snprintf(note, sizeof(note), "paused");
+	if (gc->lock.vfr_now)
+		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%sgc", note[0] ? " " : "");
 	if (gc->flog.lost || gc->ring.lost)
-		snprintf(note, sizeof(note), "lost=%" PRIu64 "/%" PRIu64, gc->flog.lost, gc->ring.lost);
+		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%slost=%" PRIu64 "/%" PRIu64,
+			 note[0] ? " " : "", gc->flog.lost, gc->ring.lost);
 
 	if (gc->ring.size && gc->config.buffering && gc->lock.active)
 		snprintf(lockcols, sizeof(lockcols), "%.0f,%.3f", gc->lock.smooth_ns, gc->lock.pos);

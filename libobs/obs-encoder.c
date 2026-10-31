@@ -1116,6 +1116,16 @@ enum obs_scale_type obs_encoder_get_scale_type(obs_encoder_t *encoder)
 	return encoder->gpu_scale_type;
 }
 
+void obs_encoder_get_timebase(const obs_encoder_t *encoder, uint32_t *num, uint32_t *den)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_get_timebase"))
+		return;
+	if (num)
+		*num = encoder->timebase_num * (encoder->frame_rate_divisor ? encoder->frame_rate_divisor : 1);
+	if (den)
+		*den = encoder->timebase_den;
+}
+
 uint32_t obs_encoder_get_frame_rate_divisor(const obs_encoder_t *encoder)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_set_frame_rate_divisor"))
@@ -1222,8 +1232,16 @@ static void encoder_set_video(obs_encoder_t *encoder, video_t *video)
 	if (video) {
 		voi = video_output_get_info(video);
 		encoder->media = video;
-		encoder->timebase_num = voi->fps_den;
-		encoder->timebase_den = voi->fps_num;
+		encoder->game_clock = obs->video.game_clock_enabled;
+		if (encoder->game_clock) {
+			/* game-clock output: real-time pts in 1/(fps_num * 1000),
+			 * 16.7 us at 60 fps; see video_frame_pts() */
+			encoder->timebase_num = 1;
+			encoder->timebase_den = voi->fps_num * 1000;
+		} else {
+			encoder->timebase_num = voi->fps_den;
+			encoder->timebase_den = voi->fps_num;
+		}
 
 		if (encoder->frame_rate_divisor) {
 			encoder->fps_override =
@@ -1514,7 +1532,10 @@ static inline bool video_pause_check_internal(struct pause_data *pause, uint64_t
 		return false;
 	}
 
-	if (ts == pause->ts_end) {
+	/* Frame-locked capture (game-clock output): video ticks may be paced
+	 * off the nominal grid, so the pause end is a bound, not an exact
+	 * timestamp to hit (with grid ticks this is the same comparison). */
+	if (pause->ts_end && ts >= pause->ts_end) {
 		pause->ts_start = 0;
 		pause->ts_end = 0;
 
@@ -1582,6 +1603,26 @@ void handle_encoder_group_reconfigure_request(obs_encoder_t *encoder)
 	pthread_mutex_unlock(&group->mutex);
 }
 
+/* Frame-locked capture, game-clock output: the pts of a video frame is its
+ * real timestamp relative to the encoder's first frame, less the time spent
+ * paused, in the encoder's timebase.  Without game-clock output it is the
+ * frame counter as before. */
+int64_t video_frame_pts(struct obs_encoder *encoder, uint64_t timestamp)
+{
+	uint64_t paused, rel;
+
+	if (!encoder->game_clock)
+		return encoder->cur_pts;
+
+	pthread_mutex_lock(&encoder->pause.mutex);
+	paused = encoder->pause.ts_offset;
+	pthread_mutex_unlock(&encoder->pause.mutex);
+
+	rel = timestamp > encoder->start_ts ? timestamp - encoder->start_ts : 0;
+	rel = rel > paused ? rel - paused : 0;
+	return (int64_t)util_mul_div64(rel, encoder->timebase_den, 1000000000ULL);
+}
+
 static const char *receive_video_name = "receive_video";
 static void receive_video(void *param, struct video_data *frame)
 {
@@ -1594,7 +1635,9 @@ static void receive_video(void *param, struct video_data *frame)
 		struct obs_encoder_group *group = encoder->encoder_group;
 		bool ready = false;
 		pthread_mutex_lock(&group->mutex);
-		ready = group->start_timestamp == frame->timestamp;
+		/* a bound, not an exact match: game-clock frames are stamped
+		 * with their presentation time, not with the tick time */
+		ready = frame->timestamp >= group->start_timestamp;
 		pthread_mutex_unlock(&group->mutex);
 		if (!ready)
 			goto wait_for_audio;
@@ -1631,7 +1674,7 @@ static void receive_video(void *param, struct video_data *frame)
 		encoder->start_ts = frame->timestamp;
 
 	enc_frame.frames = 1;
-	enc_frame.pts = encoder->cur_pts;
+	enc_frame.pts = video_frame_pts(encoder, frame->timestamp);
 
 	if (do_encode(encoder, &enc_frame, &frame->timestamp))
 		encoder->cur_pts += encoder->timebase_num * encoder->frame_rate_divisor;

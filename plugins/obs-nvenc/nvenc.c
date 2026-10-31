@@ -1347,11 +1347,33 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 
 	if (enc->packet_data.num) {
 		int64_t dts;
-		deque_pop_front(&enc->dts_list, &dts, sizeof(dts));
 
-		/* subtract bframe delay from dts for H.264/HEVC */
-		if (enc->codec != CODEC_AV1)
-			dts -= enc->props.bf * packet->timebase_num;
+		/* The dts of output packet k is the input pts of frame k - bf (the
+		 * frame bf positions earlier in input order).  For constant frame
+		 * durations this equals the old "pts - bf frames" rule; for the
+		 * variable durations of game-clock output it is the rule that keeps
+		 * dts <= pts for every B-frame, whatever a frame's length.  Seeding
+		 * the queue with bf entries before the first frame makes every pop
+		 * return that value (H.264/HEVC only, AV1 has no reordering). */
+		if (!enc->dts_seeded) {
+			enc->dts_seeded = true;
+			if (enc->codec != CODEC_AV1 && enc->props.bf > 0) {
+				video_t *video = obs_encoder_video(enc->encoder);
+				const struct video_output_info *voi = video_output_get_info(video);
+				/* nominal duration of one encoded frame in units of the packet timebase */
+				int64_t frame = packet->timebase_den * (int64_t)voi->fps_den / (int64_t)voi->fps_num *
+						(int64_t)obs_encoder_get_frame_rate_divisor(enc->encoder);
+				int64_t first;
+
+				deque_peek_front(&enc->dts_list, &first, sizeof(first));
+				for (int64_t i = 1; i <= enc->props.bf; i++) {
+					int64_t synth = first - i * frame;
+					deque_push_front(&enc->dts_list, &synth, sizeof(synth));
+				}
+			}
+		}
+
+		deque_pop_front(&enc->dts_list, &dts, sizeof(dts));
 
 		*received_packet = true;
 		packet->data = enc->packet_data.array;

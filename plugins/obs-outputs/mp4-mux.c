@@ -2240,6 +2240,46 @@ static size_t mp4_write_mfhd(struct mp4_mux *mux)
 }
 
 /// 8.8.7 Track Fragment Header Box
+/* Frame-locked capture (game-clock output): video samples may have varying
+ * durations.  Fragments then need per-sample durations in the trun, and the
+ * tfhd must not claim a default duration.  The checks below compare every
+ * sample (the original loop only kept the result of the last one). */
+static inline bool fragment_durations_match(const struct mp4_track *track)
+{
+	if (track->sample_size || !track->fragment_samples.num)
+		return true;
+
+	uint32_t duration = track->fragment_samples.array[0].duration;
+	for (size_t idx = 1; idx < track->fragment_samples.num; idx++) {
+		if (track->fragment_samples.array[idx].duration != duration)
+			return false;
+	}
+	return true;
+}
+
+static inline bool fragment_sizes_match(const struct mp4_track *track)
+{
+	if (track->sample_size || !track->fragment_samples.num)
+		return true;
+
+	uint32_t size = track->fragment_samples.array[0].size;
+	for (size_t idx = 1; idx < track->fragment_samples.num; idx++) {
+		if (track->fragment_samples.array[idx].size != size)
+			return false;
+	}
+	return true;
+}
+
+static inline uint32_t fragment_sample_duration(const struct mp4_track *track, const struct fragment_sample *smp)
+{
+	uint64_t duration = smp->duration;
+	if (track->type == TRACK_VIDEO) {
+		/* Convert duration to track timescale */
+		duration = util_mul_div64(duration, track->timescale, track->timebase_den);
+	}
+	return (uint32_t)duration;
+}
+
 static size_t mp4_write_tfhd(struct mp4_mux *mux, struct mp4_track *track, size_t moof_start)
 {
 	struct serializer *s = mux->serializer;
@@ -2248,8 +2288,8 @@ static size_t mp4_write_tfhd(struct mp4_mux *mux, struct mp4_track *track, size_
 	uint32_t flags = BASE_DATA_OFFSET_PRESENT | DEFAULT_SAMPLE_FLAGS_PRESENT;
 
 	/* Add default size/duration if all samples match. */
-	bool durations_match = true;
-	bool sizes_match = true;
+	bool durations_match = fragment_durations_match(track);
+	bool sizes_match = fragment_sizes_match(track);
 	uint32_t duration;
 	uint32_t sample_size;
 
@@ -2259,14 +2299,6 @@ static size_t mp4_write_tfhd(struct mp4_mux *mux, struct mp4_track *track, size_
 	} else {
 		duration = track->fragment_samples.array[0].duration;
 		sample_size = track->fragment_samples.array[0].size;
-
-		for (size_t idx = 1; idx < track->fragment_samples.num; idx++) {
-			uint32_t frag_duration = track->fragment_samples.array[idx].duration;
-			uint32_t frag_size = track->fragment_samples.array[idx].size;
-
-			durations_match = frag_duration == duration;
-			sizes_match = frag_size == sample_size;
-		}
 	}
 
 	if (durations_match)
@@ -2331,9 +2363,12 @@ static size_t mp4_write_trun(struct mp4_mux *mux, struct mp4_track *track, uint3
 	int64_t start = serializer_get_pos(s);
 
 	uint32_t flags = DATA_OFFSET_PRESENT;
+	const bool per_sample_durations = !fragment_durations_match(track);
 
 	if (!track->sample_size)
 		flags |= SAMPLE_SIZE_PRESENT;
+	if (per_sample_durations)
+		flags |= SAMPLE_DURATION_PRESENT;
 
 	if (track->type == TRACK_VIDEO) {
 		flags |= FIRST_SAMPLE_FLAGS_PRESENT;
@@ -2371,6 +2406,9 @@ static size_t mp4_write_trun(struct mp4_mux *mux, struct mp4_track *track, uint3
 
 	for (size_t idx = 0; idx < sample_count; idx++) {
 		struct fragment_sample *smp = &track->fragment_samples.array[idx];
+
+		if (per_sample_durations)
+			s_wb32(s, fragment_sample_duration(track, smp)); // sample_duration
 
 		s_wb32(s, smp->size); // sample_size
 
