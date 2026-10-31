@@ -18,6 +18,7 @@
 #include "obs.h"
 #include "obs-internal.h"
 #include "util/util_uint64.h"
+#include <math.h>
 
 #define encoder_active(encoder) os_atomic_load_bool(&encoder->active)
 #define set_encoder_active(encoder, val) os_atomic_set_bool(&encoder->active, val)
@@ -174,6 +175,7 @@ obs_encoder_t *obs_audio_encoder_create(const char *id, const char *name, obs_da
 
 static void receive_video(void *param, struct video_data *frame);
 static void receive_audio(void *param, size_t mix_idx, struct audio_data *data);
+static void retime_reset(struct obs_encoder *encoder);
 
 static inline void get_audio_info(const struct obs_encoder *encoder, struct audio_convert_info *info)
 {
@@ -372,6 +374,12 @@ static void add_connection(struct obs_encoder *encoder)
 		struct audio_convert_info audio_info = {0};
 		get_audio_info(encoder, &audio_info);
 
+		/* Phase 5b retimed CFR: latched for this run of the encoder */
+		encoder->retime = obs->video.game_clock_enabled && obs->video.game_clock_retime;
+		encoder->retime_info.samples_per_sec = audio_info.samples_per_sec;
+		encoder->retime_info.format = audio_info.format;
+		encoder->retime_info.speakers = audio_info.speakers;
+
 		audio_output_connect(encoder->media, encoder->mixer_idx, &audio_info, receive_audio, encoder);
 	} else {
 		struct video_scale_info info = {0};
@@ -414,6 +422,8 @@ static void remove_connection(struct obs_encoder *encoder, bool shutdown)
 {
 	if (encoder->info.type == OBS_ENCODER_AUDIO) {
 		audio_output_disconnect(encoder->media, encoder->mixer_idx, receive_audio, encoder);
+		/* Phase 5b: no more audio callbacks now; log the run and free the resampler */
+		retime_reset(encoder);
 	} else {
 		if (gpu_encode_available(encoder)) {
 			stop_gpu_encode(encoder);
@@ -457,6 +467,7 @@ static inline void free_audio_buffers(struct obs_encoder *encoder)
 		bfree(encoder->audio_output_buffer[i]);
 		encoder->audio_output_buffer[i] = NULL;
 	}
+	retime_reset(encoder);
 }
 
 void obs_encoder_destroy(obs_encoder_t *encoder)
@@ -829,6 +840,7 @@ static inline void obs_encoder_start_internal(obs_encoder_t *encoder, encoded_ca
 		pause_reset(&encoder->pause);
 
 		encoder->cur_pts = 0;
+		retime_reset(encoder);
 		add_connection(encoder);
 	}
 }
@@ -1232,7 +1244,7 @@ static void encoder_set_video(obs_encoder_t *encoder, video_t *video)
 	if (video) {
 		voi = video_output_get_info(video);
 		encoder->media = video;
-		encoder->game_clock = obs->video.game_clock_enabled;
+		encoder->game_clock = obs->video.game_clock_enabled && !obs->video.game_clock_retime;
 		if (encoder->game_clock) {
 			/* game-clock output: real-time pts in 1/(fps_num * 1000),
 			 * 16.7 us at 60 fps; see video_frame_pts() */
@@ -1877,6 +1889,96 @@ bool audio_pause_check(struct pause_data *pause, struct audio_data *data, size_t
 }
 
 static const char *receive_audio_name = "receive_audio";
+/* Frame-locked capture, Phase 5b: retimed constant frame rate.
+ *
+ * With game-clock output the video thread is paced to the game, one tick per
+ * game frame.  In retimed mode the video pts still count frames, so the file
+ * runs at the game's rate: 0.3 % faster than real time while a 59.8 fps game
+ * keeps presenting, at real time during a stall (nominal ticks, repeats).  The
+ * audio has to follow.  Every audio chunk passes through a same-rate resampler
+ * whose rate is trimmed so that the audio sent to the encoder tracks the paired
+ * video encoder's file time (its frame count), keeping the offset the two had
+ * when the audio started.  The lag is filtered over about two seconds and
+ * corrected over the next second, at most one percent; a 59.8 fps game needs
+ * about 160 of 48000 samples removed per second (0.3 %, six cents of pitch). */
+static void retime_reset(struct obs_encoder *encoder)
+{
+	if (encoder->retime_rs) {
+		blog(LOG_INFO,
+		     "'%s': retime: %" PRIu64 " samples in, %" PRIu64 " out, last trim %d samples/s, "
+		     "largest filtered lag %.1f ms",
+		     encoder->context.name, encoder->retime_in, encoder->retime_out, encoder->retime_delta,
+		     encoder->retime_max_drift * 1000.0);
+		audio_resampler_destroy(encoder->retime_rs);
+		encoder->retime_rs = NULL;
+	}
+	encoder->retime_in = 0;
+	encoder->retime_out = 0;
+	encoder->retime_v0 = 0.0;
+	encoder->retime_drift = 0.0;
+	encoder->retime_max_drift = 0.0;
+	encoder->retime_delta = 0;
+}
+
+static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio)
+{
+	struct obs_encoder *venc;
+	uint8_t *output[MAX_AV_PLANES] = {0};
+	uint32_t out_frames = 0;
+	uint64_t ts_offset = 0;
+	double vtime, atime, drift;
+	int delta, limit;
+
+	if (!encoder->paired_encoders.num || !encoder->samplerate)
+		return;
+	venc = obs_weak_encoder_get_encoder(encoder->paired_encoders.array[0]);
+	if (!venc)
+		return;
+	/* the video file time: frames encoded so far, pts units are 1/timebase_den */
+	vtime = venc->timebase_den ? (double)venc->cur_pts / (double)venc->timebase_den : 0.0;
+	obs_encoder_release(venc);
+
+	if (!encoder->retime_rs) {
+		encoder->retime_rs = audio_resampler_create(&encoder->retime_info, &encoder->retime_info);
+		if (!encoder->retime_rs) {
+			blog(LOG_WARNING, "'%s': retime: could not create the resampler, audio passes unchanged",
+			     encoder->context.name);
+			encoder->retime = false;
+			return;
+		}
+		encoder->retime_v0 = vtime;
+		blog(LOG_INFO, "'%s': retime: following the video file time from %.3f s", encoder->context.name,
+		     vtime);
+	}
+
+	atime = (double)encoder->retime_out / (double)encoder->samplerate;
+	drift = (vtime - encoder->retime_v0) - atime; /* > 0: the audio is behind the video file time */
+	encoder->retime_drift += (drift - encoder->retime_drift) * 0.01;
+	if (fabs(encoder->retime_drift) > encoder->retime_max_drift)
+		encoder->retime_max_drift = fabs(encoder->retime_drift);
+
+	/* add (remove) the filtered lag over the next second, at most one percent */
+	limit = (int)encoder->samplerate / 100;
+	delta = (int)lrint(encoder->retime_drift * (double)encoder->samplerate);
+	if (delta > limit)
+		delta = limit;
+	else if (delta < -limit)
+		delta = -limit;
+	encoder->retime_delta = delta;
+	/* re-issued every chunk: a compensation runs out after its distance */
+	audio_resampler_set_compensation(encoder->retime_rs, delta, (int)encoder->samplerate);
+
+	if (!audio_resampler_resample(encoder->retime_rs, output, &out_frames, &ts_offset,
+				      (const uint8_t *const *)audio->data, audio->frames))
+		return; /* this chunk passes unchanged */
+
+	encoder->retime_in += audio->frames;
+	encoder->retime_out += out_frames;
+	for (size_t i = 0; i < MAX_AV_PLANES; i++)
+		audio->data[i] = output[i];
+	audio->frames = out_frames;
+}
+
 static void receive_audio(void *param, size_t mix_idx, struct audio_data *in)
 {
 	profile_start(receive_audio_name);
@@ -1892,6 +1994,11 @@ static void receive_audio(void *param, size_t mix_idx, struct audio_data *in)
 
 	if (audio_pause_check(&encoder->pause, &audio, encoder->samplerate))
 		goto end;
+
+	/* Phase 5b: once the audio has started (start_ts set by the first
+	 * chunk), follow the video file time */
+	if (encoder->retime && encoder->start_ts)
+		retime_audio(encoder, &audio);
 
 	if (!buffer_audio(encoder, &audio))
 		goto end;

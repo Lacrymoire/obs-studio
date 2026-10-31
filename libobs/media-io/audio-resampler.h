@@ -36,6 +36,12 @@ struct resample_info {
 EXPORT audio_resampler_t *audio_resampler_create(const struct resample_info *dst, const struct resample_info *src);
 EXPORT void audio_resampler_destroy(audio_resampler_t *resampler);
 
+/* Frame-locked capture, retimed CFR: trim the output rate so that the next
+ * compensation_distance output samples carry sample_delta samples more (or
+ * fewer, when negative) than the input would give.  Soft, click-free. */
+EXPORT bool audio_resampler_set_compensation(audio_resampler_t *resampler, int sample_delta,
+					     int compensation_distance);
+
 EXPORT bool audio_resampler_resample(audio_resampler_t *resampler, uint8_t *output[], uint32_t *out_frames,
 				     uint64_t *ts_offset, const uint8_t *const input[], uint32_t in_frames);
 

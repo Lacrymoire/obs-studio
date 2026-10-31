@@ -418,6 +418,8 @@ struct obs_core_video {
 	 * source sets the per-tick fields from its video_tick (video thread);
 	 * video_sleep consumes and clears them on the same thread. */
 	volatile bool game_clock_enabled; /* user setting: real-time pts, paced ticks */
+	volatile bool game_clock_retime;  /* user setting: paced ticks but frame-count pts (constant
+					   * frame rate) and the audio trimmed to follow (Phase 5b) */
 	uint64_t game_clock_frame_ts;     /* timestamp of the frame rendered this tick (0 = tick time) */
 	uint64_t game_clock_next_tick;    /* wall time the next tick should run at (0 = nominal) */
 	bool game_clock_skip;             /* this tick's frame is a repeat: do not encode it */
@@ -1438,6 +1440,18 @@ struct obs_encoder {
 	 * timebase is set; pts then come from frame timestamps (see
 	 * video_frame_pts), cur_pts stays the frame counter */
 	bool game_clock;
+	/* Phase 5b retimed CFR, audio encoders: the audio is passed through a
+	 * same-rate resampler whose rate is trimmed so that the audio sent to
+	 * the encoder follows the paired video encoder's file time (see
+	 * retime_audio) */
+	bool retime;
+	struct resample_info retime_info;
+	audio_resampler_t *retime_rs;
+	uint64_t retime_in, retime_out; /* samples in / out since the audio started */
+	double retime_v0;               /* video file time when the audio started */
+	double retime_drift;            /* filtered lag of the audio behind the video file time, s */
+	double retime_max_drift;
+	int retime_delta;               /* samples per second currently added (negative: removed) */
 
 	struct deque audio_input_buffer[MAX_AV_PLANES];
 	uint8_t *audio_output_buffer[MAX_AV_PLANES];

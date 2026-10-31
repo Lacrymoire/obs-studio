@@ -1145,6 +1145,20 @@ bool obs_get_game_clock_enabled(void)
 	return obs ? obs->video.game_clock_enabled : false;
 }
 
+void obs_set_game_clock_retime(bool retime)
+{
+	if (!obs)
+		return;
+	if (obs->video.game_clock_retime != retime)
+		blog(LOG_INFO, "game-clock output: retimed constant frame rate %s", retime ? "enabled" : "disabled");
+	obs->video.game_clock_retime = retime;
+}
+
+bool obs_get_game_clock_retime(void)
+{
+	return obs ? obs->video.game_clock_retime : false;
+}
+
 void obs_video_set_game_clock_tick(uint64_t frame_ts_ns, uint64_t next_tick_ns, bool skip)
 {
 	if (!obs || !obs->video.game_clock_enabled)

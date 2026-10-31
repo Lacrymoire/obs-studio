@@ -422,7 +422,7 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 	obsx264->params.i_fps_den = voi->fps_den;
 	obsx264->params.i_timebase_num = voi->fps_den;
 	obsx264->params.i_timebase_den = voi->fps_num;
-	if (obs_get_game_clock_enabled()) {
+	if (obs_get_game_clock_enabled() && !obs_get_game_clock_retime()) {
 		/* frame-locked capture, game-clock output: real-time pts in
 		 * 1/(fps_num * 1000), variable frame durations */
 		obsx264->params.b_vfr_input = true;

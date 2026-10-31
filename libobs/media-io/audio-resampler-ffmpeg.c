@@ -178,6 +178,13 @@ void audio_resampler_destroy(audio_resampler_t *rs)
 	}
 }
 
+bool audio_resampler_set_compensation(audio_resampler_t *rs, int sample_delta, int compensation_distance)
+{
+	if (!rs || !rs->context)
+		return false;
+	return swr_set_compensation(rs->context, sample_delta, compensation_distance) >= 0;
+}
+
 bool audio_resampler_resample(audio_resampler_t *rs, uint8_t *output[], uint32_t *out_frames, uint64_t *ts_offset,
 			      const uint8_t *const input[], uint32_t in_frames)
 {

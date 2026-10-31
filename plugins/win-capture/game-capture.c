@@ -1043,7 +1043,8 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 		obs_get_version_string(), ovi.fps_num, ovi.fps_den, ovi.base_width, ovi.base_height,
 		ovi.output_width, ovi.output_height, gc->cx, gc->cy, gc->ring.size,
 		gc->config.buffering && gc->ring.size ? "on" : "off", gc->config.buffer_delay,
-		obs_get_game_clock_enabled() ? "on" : "off", obs_source_get_name(gc->source), rec.array);
+		obs_get_game_clock_enabled() ? (obs_get_game_clock_retime() ? "retime" : "on") : "off",
+		obs_source_get_name(gc->source), rec.array);
 	fprintf(gc->flog.file,
 		"# present: one row per frame the hook copied (counter, present time, ring slot)\n"
 		"# tick: one row per OBS video tick: nominal tick time, wall time, the frame shown (counter, present\n"

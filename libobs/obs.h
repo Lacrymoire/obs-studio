@@ -945,6 +945,11 @@ EXPORT uint64_t obs_get_video_frame_time(void);
  * encoded.  Ignored while game-clock output is disabled. */
 EXPORT void obs_set_game_clock_enabled(bool enabled);
 EXPORT bool obs_get_game_clock_enabled(void);
+/* Phase 5b: with game-clock output enabled, keep frame-count pts (a constant
+ * frame rate file that runs at the game's rate) and trim the audio to follow
+ * instead of writing real-time pts. */
+EXPORT void obs_set_game_clock_retime(bool retime);
+EXPORT bool obs_get_game_clock_retime(void);
 EXPORT void obs_video_set_game_clock_tick(uint64_t frame_ts_ns, uint64_t next_tick_ns, bool skip);
 
 EXPORT double obs_get_active_fps(void);
