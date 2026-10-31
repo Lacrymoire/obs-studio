@@ -44,6 +44,8 @@
 #define SETTINGS_COMPAT_INFO         "compat_info"
 #define SETTING_FRAME_LOG            "framelock_log"
 #define SETTING_FRAME_RING           "framelock_ring"
+#define SETTING_BUFFERING            "framelock_buffering"
+#define SETTING_BUFFER_DELAY         "framelock_delay"
 
 /* deprecated */
 #define SETTING_ANY_FULLSCREEN   "capture_any_fullscreen"
@@ -82,6 +84,10 @@
 #define TEXT_FRAME_LOG_TT          obs_module_text("GameCapture.FrameLog.Description")
 #define TEXT_FRAME_RING            obs_module_text("GameCapture.FrameRing")
 #define TEXT_FRAME_RING_TT         obs_module_text("GameCapture.FrameRing.Description")
+#define TEXT_BUFFERING             obs_module_text("GameCapture.Buffering")
+#define TEXT_BUFFERING_TT          obs_module_text("GameCapture.Buffering.Description")
+#define TEXT_BUFFER_DELAY          obs_module_text("GameCapture.BufferDelay")
+#define TEXT_BUFFER_DELAY_TT       obs_module_text("GameCapture.BufferDelay.Description")
 
 #define TEXT_MODE_ANY            TEXT_ANY_FULLSCREEN
 #define TEXT_MODE_WINDOW         obs_module_text("GameCapture.CaptureWindow")
@@ -120,7 +126,17 @@ struct game_capture_config {
 	bool capture_audio;
 	bool frame_log;
 	uint32_t frame_ring;
+	bool buffering;
+	uint32_t buffer_delay;
 };
+
+/* frame-locked capture, Phase 3 constants */
+#define LOCK_FIT_N 128          /* present records in the least-squares window (about 2 s at 60 fps) */
+#define LOCK_FIT_MIN 16         /* records before the fitted clock is trusted */
+#define LOCK_MAX_DELAY (FRAME_RING_MAX - 3)
+#define LOCK_HYSTERESIS 0.1     /* frames; a repeat or skip needs the timeline this far past the edge */
+#define LOCK_MAX_COUNTER_GAP 16 /* presents missing in a row: the game paused, refit from scratch */
+#define LOCK_MAX_TIME_GAP_NS 250000000ULL
 
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetThreadDpiAwarenessContext)(VOID);
@@ -209,6 +225,25 @@ struct game_capture {
 		uint64_t read; /* present records consumed from the hook's log */
 		uint64_t lost; /* records overwritten before they were read */
 	} ring;
+
+	/* frame-locked capture: Phase 3 smoothed game clock and buffered
+	 * selection (see lock_fit / lock_select) */
+	struct {
+		uint64_t counters[LOCK_FIT_N];
+		uint64_t times[LOCK_FIT_N];
+		uint32_t n, head;
+		bool ready;
+		double period_ns;        /* fitted present period */
+		double anchor_ns;        /* fitted present time of frame anchor_counter */
+		uint64_t anchor_counter;
+		uint64_t last_counter;
+		uint64_t last_time_ns;
+		uint64_t resets;
+		bool active;             /* a frame has been chosen by the timeline */
+		double pos;              /* position of the chosen frame within its tick window */
+		double smooth_ns;        /* smoothed present time of the shown frame */
+		uint64_t repeats, skips, starved, lagged;
+	} lock;
 
 	/* frame-locked capture: Phase 1 debug log state (see flog_tick) */
 	struct {
@@ -344,6 +379,165 @@ static inline float hook_rate_to_float(enum hook_rate rate)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Frame-locked capture, Phase 3: smoothed game clock and buffered selection.
+ *
+ * lock_add() feeds every present record (counter, raw present time) into a
+ * window of the last LOCK_FIT_N records; lock_fit() fits a straight line
+ * through them (least squares), which is the game's steady clock: a period
+ * and the smoothed present time of any frame.  Raw times wobble by a couple
+ * of milliseconds, the fitted line by a few hundredths.
+ *
+ * lock_select() runs once per OBS video tick at nominal tick time T.  It maps
+ * T - delay * tick into a fractional frame position x on the fitted clock and
+ * normally shows the frame after the previous one.  Only when x says that
+ * frame is more than LOCK_HYSTERESIS frames early does it repeat the previous
+ * frame, and only when x is more than LOCK_HYSTERESIS frames past the next
+ * one does it skip.  A clock difference between game and OBS then produces one
+ * single repeat or skip per beat period, never a burst, because the decision
+ * follows the smooth line and the hysteresis is far wider than its noise.  A
+ * jump in the present times (loading screen, pause, alt-tab) clears the fit;
+ * until it is trusted again the newest frame is shown, as in Phase 2. */
+
+static void lock_reset(struct game_capture *gc, const char *why)
+{
+	if (gc->lock.n && why)
+		gc->lock.resets++;
+	gc->lock.n = 0;
+	gc->lock.head = 0;
+	gc->lock.ready = false;
+	gc->lock.active = false;
+	if (why && gc->config.frame_log)
+		info("frame lock: refit (%s)", why);
+}
+
+static void lock_add(struct game_capture *gc, uint64_t counter, uint64_t time_ns)
+{
+	if (gc->lock.n) {
+		const uint64_t dc = counter - gc->lock.last_counter;
+		const uint64_t dt = time_ns - gc->lock.last_time_ns;
+
+		if (counter <= gc->lock.last_counter)
+			lock_reset(gc, "counter went backwards");
+		else if (dc > LOCK_MAX_COUNTER_GAP)
+			lock_reset(gc, "presents missing");
+		else if (dt > LOCK_MAX_TIME_GAP_NS)
+			lock_reset(gc, "long pause");
+		else if (gc->lock.ready) {
+			/* a frame far off the fitted line: the clock jumped */
+			const double predicted = gc->lock.anchor_ns +
+						 (double)(int64_t)(counter - gc->lock.anchor_counter) *
+							 gc->lock.period_ns;
+			const double err = (double)(int64_t)(time_ns - (uint64_t)predicted);
+			if (err > gc->lock.period_ns || err < -gc->lock.period_ns)
+				lock_reset(gc, "present time jumped");
+		}
+	}
+
+	gc->lock.counters[gc->lock.head] = counter;
+	gc->lock.times[gc->lock.head] = time_ns;
+	gc->lock.head = (gc->lock.head + 1) % LOCK_FIT_N;
+	if (gc->lock.n < LOCK_FIT_N)
+		gc->lock.n++;
+	gc->lock.last_counter = counter;
+	gc->lock.last_time_ns = time_ns;
+}
+
+/* least squares of present time over counter, in coordinates relative to the
+ * newest record so the doubles stay exact */
+static void lock_fit(struct game_capture *gc)
+{
+	const uint32_t n = gc->lock.n;
+	const uint32_t newest = (gc->lock.head + LOCK_FIT_N - 1) % LOCK_FIT_N;
+	const uint64_t c0 = gc->lock.counters[newest];
+	const uint64_t t0 = gc->lock.times[newest];
+	double sx = 0, sy = 0, sxx = 0, sxy = 0, mx, my, vxx, vxy;
+
+	if (n < LOCK_FIT_MIN) {
+		gc->lock.ready = false;
+		return;
+	}
+
+	for (uint32_t i = 0; i < n; i++) {
+		const uint32_t k = (newest + LOCK_FIT_N - i) % LOCK_FIT_N;
+		const double x = -(double)(int64_t)(c0 - gc->lock.counters[k]);
+		const double y = -(double)(int64_t)(t0 - gc->lock.times[k]);
+		sx += x;
+		sy += y;
+		sxx += x * x;
+		sxy += x * y;
+	}
+	mx = sx / n;
+	my = sy / n;
+	vxx = sxx - n * mx * mx;
+	vxy = sxy - n * mx * my;
+	if (vxx <= 0.0) {
+		gc->lock.ready = false;
+		return;
+	}
+
+	gc->lock.period_ns = vxy / vxx;
+	gc->lock.anchor_counter = c0;
+	gc->lock.anchor_ns = (double)t0 + (my - gc->lock.period_ns * mx);
+	gc->lock.ready = gc->lock.period_ns > 1000000.0; /* a sane clock runs slower than 1000 fps */
+}
+
+/* smoothed present time of frame counter on the fitted clock */
+static inline double lock_time_of(const struct game_capture *gc, uint64_t counter)
+{
+	return gc->lock.anchor_ns + (double)(int64_t)(counter - gc->lock.anchor_counter) * gc->lock.period_ns;
+}
+
+/* chooses the frame counter to show at nominal tick time tick_ns; newest is the
+ * newest copied frame, oldest the oldest one that is safe to switch to (the
+ * hook may be writing the slot of the frame before it) */
+static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t newest, uint64_t oldest)
+{
+	const uint64_t delay_ns = (uint64_t)gc->config.buffer_delay * obs_get_frame_interval_ns();
+	const double target = (double)(int64_t)(tick_ns - delay_ns);
+	const double x = (double)(int64_t)gc->lock.anchor_counter + (target - gc->lock.anchor_ns) / gc->lock.period_ns;
+	const uint64_t prev = gc->lock.shown;
+	uint64_t c;
+
+	if (!gc->lock.active) {
+		/* first choice on this clock: the frame due at the target time */
+		c = x > 0.0 ? (uint64_t)x : 0;
+		gc->lock.active = true;
+	} else {
+		const uint64_t next = gc->lock.shown + 1;
+		const double e = x - (double)(int64_t)next;
+
+		if (e < -LOCK_HYSTERESIS) {
+			c = gc->lock.shown; /* the next frame is not due yet: repeat */
+			gc->lock.repeats++;
+		} else if (e >= 2.0 + LOCK_HYSTERESIS) {
+			c = (uint64_t)x; /* far behind (the game paused and resumed): resync */
+			gc->lock.skips++;
+		} else if (e >= 1.0 + LOCK_HYSTERESIS) {
+			c = next + 1; /* the frame after next is due as well: skip one */
+			gc->lock.skips++;
+		} else {
+			c = next;
+		}
+	}
+
+	if (c > newest) {
+		c = newest; /* the game has not presented it yet */
+		gc->lock.starved++;
+	}
+	if (c < oldest && !(gc->lock.active && c == prev)) {
+		/* switching to a frame whose slot the hook may be rewriting; the
+		 * frame shown last tick is safe, its slot is read_slot */
+		c = oldest;
+		gc->lock.lagged++;
+	}
+
+	gc->lock.shown = c;
+	gc->lock.pos = x - (double)(int64_t)c;
+	gc->lock.smooth_ns = lock_time_of(gc, c);
+	return c;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Frame-locked capture, Phase 2: the frame ring.
  *
  * With a ring the hook copies every present into one of ring_size shared
@@ -398,7 +592,10 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 	gc->ring.size = n;
 	gc->ring.shown_slot = 0;
 	gc->shtex_data->read_slot = 0;
-	info("frame ring: %u slots of %" PRIu32 "x%" PRIu32, n, gc->cx, gc->cy);
+	memset(&gc->lock, 0, sizeof(gc->lock));
+	info("frame ring: %u slots of %" PRIu32 "x%" PRIu32 "; buffering %s, delay %" PRIu32 " frame%s", n, gc->cx,
+	     gc->cy, gc->config.buffering ? "on" : "off", gc->config.buffer_delay,
+	     gc->config.buffer_delay == 1 ? "" : "s");
 	return true;
 }
 
@@ -422,11 +619,39 @@ static void ring_tick(struct game_capture *gc)
 		gc->ring.lost += count - read - PRESENT_LOG_SIZE;
 		read = count - PRESENT_LOG_SIZE;
 	}
-	if (count == read)
+	if (count == read && !(gc->config.buffering && gc->lock.ready))
 		return; /* no new frame since the last tick: keep showing the same slot */
 
-	/* Phase 2 choice: the newest copied frame */
-	rec = &shtex->present_log[(count - 1) % PRESENT_LOG_SIZE];
+	/* Phase 3: feed the new records to the smoothed clock */
+	for (uint64_t i = read; i < count; i++) {
+		rec = &shtex->present_log[i % PRESENT_LOG_SIZE];
+		lock_add(gc, rec->counter, rec->time_ns);
+	}
+	if (count != read)
+		lock_fit(gc);
+	gc->ring.read = count;
+
+	if (count == 0)
+		return;
+
+	if (gc->config.buffering && gc->lock.ready) {
+		/* Phase 3 choice: the frame the game's timeline puts at this tick,
+		 * delay frames back; its slot is still intact while it is newer than
+		 * newest - (ring - 2) */
+		const uint64_t oldest = count > (uint64_t)(gc->ring.size - 2) ? count - (gc->ring.size - 2) : 1;
+		const uint64_t c = lock_select(gc, obs_get_video_frame_time(), count, oldest);
+
+		rec = &shtex->present_log[(c - 1) % PRESENT_LOG_SIZE];
+		if (rec->counter != c)
+			rec = &shtex->present_log[(count - 1) % PRESENT_LOG_SIZE];
+	} else {
+		/* Phase 2 choice: the newest copied frame */
+		rec = &shtex->present_log[(count - 1) % PRESENT_LOG_SIZE];
+		gc->lock.active = false;
+	}
+
+	if (rec->counter == gc->ring.shown_counter)
+		return; /* same frame as last tick: nothing to switch */
 	if (rec->slot < gc->ring.size) {
 		gc->ring.shown_slot = rec->slot;
 		gc->ring.shown_counter = rec->counter;
@@ -434,7 +659,6 @@ static void ring_tick(struct game_capture *gc)
 		gc->texture = gc->ring.textures[rec->slot];
 		shtex->read_slot = rec->slot;
 	}
-	gc->ring.read = count;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -475,12 +699,14 @@ static bool flog_find_recording(void *param, obs_output_t *output)
 static void flog_close(struct game_capture *gc, const char *reason)
 {
 	if (gc->flog.file) {
-		fprintf(gc->flog.file, "end,%" PRIu64 ",%" PRIu64 ",,,,,%s,,\n", obs_get_video_frame_time(),
+		fprintf(gc->flog.file, "end,%" PRIu64 ",%" PRIu64 ",,,,,%s,,,,\n", obs_get_video_frame_time(),
 			os_gettime_ns(), reason);
 		fclose(gc->flog.file);
 		gc->flog.file = NULL;
-		info("frame log closed (%s): %s, %" PRIu64 " ticks, %" PRIu64 " lost log entries", reason,
-		     gc->flog.path, gc->flog.ticks, gc->flog.lost);
+		info("frame log closed (%s): %s, %" PRIu64 " ticks, %" PRIu64 " lost log entries; frame lock: %" PRIu64
+		     " repeats, %" PRIu64 " skips, %" PRIu64 " starved, %" PRIu64 " lagged, %" PRIu64 " refits",
+		     reason, gc->flog.path, gc->flog.ticks, gc->flog.lost, gc->lock.repeats, gc->lock.skips,
+		     gc->lock.starved, gc->lock.lagged, gc->lock.resets);
 	}
 
 	if (gc->flog.output) {
@@ -554,21 +780,25 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 	gc->flog.ticks = 0;
 
 	obs_get_video_info(&ovi);
-	fprintf(gc->flog.file, "# obs-frame-lock log v2\n");
+	fprintf(gc->flog.file, "# obs-frame-lock log v3\n");
 	fprintf(gc->flog.file,
 		"# obs=%s fps=%" PRIu32 "/%" PRIu32 " base=%" PRIu32 "x%" PRIu32 " output=%" PRIu32 "x%" PRIu32
-		" capture=%" PRIu32 "x%" PRIu32 " ring=%" PRIu32 " source=%s recording=%s\n",
+		" capture=%" PRIu32 "x%" PRIu32 " ring=%" PRIu32 " buffering=%s delay=%" PRIu32
+		" source=%s recording=%s\n",
 		obs_get_version_string(), ovi.fps_num, ovi.fps_den, ovi.base_width, ovi.base_height,
-		ovi.output_width, ovi.output_height, gc->cx, gc->cy, gc->ring.size, obs_source_get_name(gc->source),
-		rec.array);
+		ovi.output_width, ovi.output_height, gc->cx, gc->cy, gc->ring.size,
+		gc->config.buffering && gc->ring.size ? "on" : "off", gc->config.buffer_delay,
+		obs_source_get_name(gc->source), rec.array);
 	fprintf(gc->flog.file,
 		"# present: one row per frame the hook copied (counter, present time, ring slot)\n"
 		"# tick: one row per OBS video tick: nominal tick time, wall time, the frame shown (counter, present\n"
 		"#       time, slot), recording frame count, counter change since the previous tick (1 normal,\n"
-		"#       0 repeat, 2+ skip), and the hook's running count of slot conflicts\n"
+		"#       0 repeat, 2+ skip), the hook's running count of slot conflicts, and with buffering the\n"
+		"#       smoothed present time of the shown frame and its position on the timeline (frames)\n"
 		"# all *_ns values are os_gettime_ns() (QueryPerformanceCounter) nanoseconds\n");
-	fprintf(gc->flog.file, "kind,tick_ns,now_ns,counter,present_ns,out_frames,delta,note,slot,conflicts\n");
-	fprintf(gc->flog.file, "start,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,,,,\n",
+	fprintf(gc->flog.file,
+		"kind,tick_ns,now_ns,counter,present_ns,out_frames,delta,note,slot,conflicts,smooth_ns,pos\n");
+	fprintf(gc->flog.file, "start,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,,,,,,\n",
 		obs_get_video_frame_time(), os_gettime_ns(), count, latest, obs_output_get_total_frames(output));
 
 	info("frame log opened: %s", path.array);
@@ -586,6 +816,7 @@ static void flog_tick(struct game_capture *gc)
 	uint32_t slot;
 	int64_t delta;
 	char note[64];
+	char lockcols[64];
 
 	if (!enabled) {
 		if (gc->flog.file)
@@ -666,7 +897,7 @@ static void flog_tick(struct game_capture *gc)
 	}
 	for (; read < count; read++) {
 		const volatile struct present_record *rec = &shtex->present_log[read % PRESENT_LOG_SIZE];
-		fprintf(gc->flog.file, "present,,,%" PRIu64 ",%" PRIu64 ",,,,%" PRIu32 ",\n", rec->counter,
+		fprintf(gc->flog.file, "present,,,%" PRIu64 ",%" PRIu64 ",,,,%" PRIu32 ",,,\n", rec->counter,
 			rec->time_ns, rec->slot);
 	}
 
@@ -690,9 +921,15 @@ static void flog_tick(struct game_capture *gc)
 	if (gc->flog.lost || gc->ring.lost)
 		snprintf(note, sizeof(note), "lost=%" PRIu64 "/%" PRIu64, gc->flog.lost, gc->ring.lost);
 
+	if (gc->ring.size && gc->config.buffering && gc->lock.active)
+		snprintf(lockcols, sizeof(lockcols), "%.0f,%.3f", gc->lock.smooth_ns, gc->lock.pos);
+	else
+		lockcols[0] = 0;
+
 	fprintf(gc->flog.file,
-		"tick,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%" PRId64 ",%s,%" PRIu32 ",%" PRIu64 "\n",
-		tick_ns, now_ns, shown, latest, obs_output_get_total_frames(output), delta, note, slot, conflicts);
+		"tick,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%" PRId64 ",%s,%" PRIu32 ",%" PRIu64 ",%s\n",
+		tick_ns, now_ns, shown, latest, obs_output_get_total_frames(output), delta, note, slot, conflicts,
+		lockcols);
 
 	gc->flog.presents_read = count;
 	gc->flog.last_counter = shown;
@@ -849,6 +1086,16 @@ static inline void get_config(struct game_capture_config *cfg, obs_data_t *setti
 		cfg->frame_ring = 1;
 	if (cfg->frame_ring > FRAME_RING_MAX)
 		cfg->frame_ring = FRAME_RING_MAX;
+	cfg->buffering = obs_data_get_bool(settings, SETTING_BUFFERING);
+	cfg->buffer_delay = (uint32_t)obs_data_get_int(settings, SETTING_BUFFER_DELAY);
+	if (cfg->buffer_delay < 1)
+		cfg->buffer_delay = 1;
+	if (cfg->buffer_delay > LOCK_MAX_DELAY)
+		cfg->buffer_delay = LOCK_MAX_DELAY;
+	/* the shown frame sits delay (+1) frames behind the newest one and the
+	 * hook writes one slot ahead, so the ring must hold delay + 3 slots */
+	if (cfg->buffering && cfg->frame_ring < cfg->buffer_delay + 3)
+		cfg->frame_ring = cfg->buffer_delay + 3;
 }
 
 static inline int s_cmp(const char *str1, const char *str2)
@@ -956,7 +1203,9 @@ static void game_capture_update(void *data, obs_data_t *settings)
 
 	free_config(&gc->config);
 	gc->config = cfg;
-	info("frame-lock debug log: %s", gc->config.frame_log ? "on" : "off");
+	info("frame-lock buffering: %s, delay %" PRIu32 " frame%s, ring %" PRIu32 ", debug log: %s",
+	     gc->config.buffering ? "on" : "off", gc->config.buffer_delay, gc->config.buffer_delay == 1 ? "" : "s",
+	     gc->config.frame_ring, gc->config.frame_log ? "on" : "off");
 	if (!gc->config.frame_log)
 		flog_close(gc, "log disabled");
 	gc->retry_interval = DEFAULT_RETRY_INTERVAL * hook_rate_to_float(gc->config.hook_rate);
@@ -2545,6 +2794,8 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_RGBA10A2_SPACE, RGBA10A2_SPACE_SRGB);
 	obs_data_set_default_bool(settings, SETTING_FRAME_LOG, false);
 	obs_data_set_default_int(settings, SETTING_FRAME_RING, 4);
+	obs_data_set_default_bool(settings, SETTING_BUFFERING, true);
+	obs_data_set_default_int(settings, SETTING_BUFFER_DELAY, 2);
 }
 
 static bool mode_callback(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)
@@ -2704,6 +2955,12 @@ static obs_properties_t *game_capture_properties(void *data)
 	obs_properties_add_bool(ppts, SETTING_ANTI_CHEAT_HOOK, TEXT_ANTI_CHEAT_HOOK);
 
 	obs_properties_add_bool(ppts, SETTING_CAPTURE_OVERLAYS, TEXT_CAPTURE_OVERLAYS);
+
+	p = obs_properties_add_bool(ppts, SETTING_BUFFERING, TEXT_BUFFERING);
+	obs_property_set_long_description(p, TEXT_BUFFERING_TT);
+
+	p = obs_properties_add_int_slider(ppts, SETTING_BUFFER_DELAY, TEXT_BUFFER_DELAY, 1, LOCK_MAX_DELAY, 1);
+	obs_property_set_long_description(p, TEXT_BUFFER_DELAY_TT);
 
 	p = obs_properties_add_int_slider(ppts, SETTING_FRAME_RING, TEXT_FRAME_RING, 1, FRAME_RING_MAX, 1);
 	obs_property_set_long_description(p, TEXT_FRAME_RING_TT);
