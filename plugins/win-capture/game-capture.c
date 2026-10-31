@@ -146,11 +146,12 @@ struct game_capture_config {
 #define LOCK_ENGAGE_SPAN_NS 1000000000ULL /* a fresh fit must span this long before a cadence is chosen */
 /* Phase 6 grid slots (lock_add): a late present that lands on the game's own
  * grid (a whole number of periods late, within LOCK_MISS_TOL of the period,
- * at least LOCK_MISS_TOL_MIN_NS) skipped vblanks; the game's clock did not
- * move.  Only trusted when the presents sit on the line tightly (jitter at
- * most half the tolerance) and the gap is under LOCK_MISS_MAX_NS. */
-#define LOCK_MISS_TOL 0.15
-#define LOCK_MISS_TOL_MIN_NS 1000000.0
+ * at least LOCK_MISS_TOL_MIN_NS: a dropped frame's Present returns up to a
+ * couple of ms early) skipped vblanks; the game's clock did not move.  Only
+ * trusted while the ordinary presents sit on the line within that tolerance
+ * (lock_note_err) and the gap is under LOCK_MISS_MAX_NS. */
+#define LOCK_MISS_TOL 0.25
+#define LOCK_MISS_TOL_MIN_NS 2000000.0
 #define LOCK_MISS_MAX_NS 1000000000ULL
 #define LOCK_JITTER_N 32        /* window records before the jitter estimate is trusted */
 /* Phase 6: re-anchors this close together mean the carried period is wrong (the game's rate moved
@@ -267,6 +268,7 @@ struct game_capture {
 		uint64_t last_gap_ns;    /* gap before the last record (cold start: a slow game is not a pause) */
 		uint64_t span_ns;        /* time the fit window covers */
 		bool fresh;              /* the period comes from a fit spanning less than LOCK_ENGAGE_SPAN_NS (and not a full window) */
+		bool carried;            /* re-anchored: the period is carried until the new window is as mature */
 		uint64_t last_reanchor_ns;
 		uint32_t reanchor_burst;
 		/* presents off the fitted line, kept out of the window until the
@@ -299,8 +301,10 @@ struct game_capture {
 		 * slot empty, not shifted its clock.  slot = counter + skew. */
 		uint64_t skew;           /* slots the game skipped so far in this counter space */
 		uint64_t misses;         /* the same, kept over counter restarts (statistics) */
-		double jitter_ns;        /* running mean of |present - line| over the window's records */
-		uint32_t jitter_n;       /* records in that mean since the last refit */
+		double bias_ns;          /* running mean of present - line over the window's records (a phase shift) */
+		double jitter_ns;        /* running mean of |present - line - bias| (how tightly the game sits on its grid) */
+		uint32_t jitter_n;       /* records in those means since the last refit or re-anchor */
+		uint64_t last_miss;      /* slots the last record was credited with as skipped (0 = none) */
 		uint64_t shown_v;        /* slot of the frame chosen last tick */
 		struct {
 			uint64_t counter, v;
@@ -482,6 +486,7 @@ static void lock_reset(struct game_capture *gc, const char *why)
 	gc->lock.active = false;
 	gc->lock.jitter_n = 0;
 	gc->lock.fresh = true;
+	gc->lock.carried = false;
 	if (why && gc->config.frame_log)
 		info("frame lock: refit (%s)", why);
 }
@@ -546,13 +551,34 @@ static inline void lock_pending_add(struct game_capture *gc, uint64_t counter, u
 	gc->lock.last_time_ns = time_ns;
 }
 
-/* how far the presents sit from the line, a running mean over the window */
+static inline double lock_miss_tol(const struct game_capture *gc)
+{
+	const double tol = LOCK_MISS_TOL * gc->lock.period_ns;
+	return tol < LOCK_MISS_TOL_MIN_NS ? LOCK_MISS_TOL_MIN_NS : tol;
+}
+
+/* where the ordinary presents sit against the line: a running mean of the
+ * signed error (bias: the game's grid moved against the line, as the Present
+ * call's place within the vblank period does after a hitch) and of the spread
+ * about it (jitter: how tightly the game sits on its grid), each clamped to
+ * twice the miss tolerance so one hitch does not switch the miss test off */
 static inline void lock_note_err(struct game_capture *gc, double err)
 {
-	if (gc->lock.jitter_n == 0)
-		gc->lock.jitter_ns = fabs(err);
-	else
-		gc->lock.jitter_ns += (fabs(err) - gc->lock.jitter_ns) / 16.0;
+	const double cap = 2.0 * lock_miss_tol(gc);
+	double e;
+
+	if (err > cap)
+		err = cap;
+	else if (err < -cap)
+		err = -cap;
+	if (gc->lock.jitter_n == 0) {
+		gc->lock.bias_ns = err;
+		gc->lock.jitter_ns = 0.0;
+	} else {
+		gc->lock.bias_ns += (err - gc->lock.bias_ns) / 8.0;
+		e = fabs(err - gc->lock.bias_ns);
+		gc->lock.jitter_ns += (e - gc->lock.jitter_ns) / 16.0;
+	}
 	if (gc->lock.jitter_n < LOCK_JITTER_N)
 		gc->lock.jitter_n++;
 }
@@ -617,6 +643,9 @@ static void lock_reanchor(struct game_capture *gc, uint64_t counter, uint64_t ti
 	gc->lock.pending_n = 0;
 	gc->lock.anchor_counter = counter;
 	gc->lock.anchor_ns = (double)time_ns;
+	gc->lock.jitter_n = 0;
+	gc->lock.last_miss = 0;
+	gc->lock.carried = true;
 	if (new_space) {
 		/* the counters restarted: the frame on screen cannot be compared */
 		gc->lock.active = false;
@@ -648,24 +677,44 @@ static uint64_t lock_add(struct game_capture *gc, uint64_t counter, uint64_t tim
 			lock_window_add(gc, counter, v, time_ns);
 			return v;
 		}
+		if (gc->lock.last_miss && (double)gap < 0.5 * gc->lock.period_ns && gc->lock.n) {
+			/* the frame credited with skipped slots is followed by a
+			 * catch-up frame: it was late, not a skip; take it back */
+			const uint32_t last = (gc->lock.head + LOCK_FIT_N - 1) % LOCK_FIT_N;
+			const uint64_t k = gc->lock.last_miss;
+
+			gc->lock.counters[last] -= k;
+			gc->lock.skew -= k;
+			gc->lock.misses -= k;
+			if (gc->lock.last_counter) {
+				const uint32_t i = (uint32_t)((gc->lock.last_counter - 1) % PRESENT_LOG_SIZE);
+				if (gc->lock.vlog[i].counter == gc->lock.last_counter)
+					gc->lock.vlog[i].v -= k;
+			}
+		}
+		gc->lock.last_miss = 0;
 		v = counter + gc->lock.skew;
 		err = (double)time_ns - lock_time_of(gc, v);
 
-		if (gc->lock.pending_n == 0 && err > 0.5 * gc->lock.period_ns && gap < LOCK_MISS_MAX_NS &&
-		    gc->lock.jitter_n >= LOCK_JITTER_N) {
-			double tol = LOCK_MISS_TOL * gc->lock.period_ns;
+		/* the miss test is made against the game's grid, which sits bias
+		 * off the line (the line absorbs a moved grid through the window;
+		 * a steady offset costs nothing, the buffer delay covers it) */
+		if (gc->lock.pending_n == 0 && err - gc->lock.bias_ns > 0.5 * gc->lock.period_ns &&
+		    gap < LOCK_MISS_MAX_NS && gc->lock.jitter_n >= LOCK_JITTER_N) {
+			const double tol = lock_miss_tol(gc);
+			const double eg = err - gc->lock.bias_ns;
 
-			if (tol < LOCK_MISS_TOL_MIN_NS)
-				tol = LOCK_MISS_TOL_MIN_NS;
-			if (gc->lock.jitter_ns <= 0.5 * tol) {
-				const double k = (double)llround(err / gc->lock.period_ns);
+			if (gc->lock.jitter_ns <= tol) {
+				const double k = (double)llround(eg / gc->lock.period_ns);
 
-				if (k >= 1.0 && fabs(err - k * gc->lock.period_ns) <= tol) {
-					/* on the grid, k slots late: the game skipped them */
+				if (k >= 1.0 && fabs(eg - k * gc->lock.period_ns) <= tol) {
+					/* on the grid, k slots late: the game skipped them
+					 * (its own Present timing is not the game's usual,
+					 * so it does not count towards the jitter) */
 					gc->lock.skew += (uint64_t)k;
 					gc->lock.misses += (uint64_t)k;
+					gc->lock.last_miss = (uint64_t)k;
 					v += (uint64_t)k;
-					lock_note_err(gc, err - k * gc->lock.period_ns);
 					lock_window_add(gc, counter, v, time_ns);
 					return v;
 				}
@@ -775,9 +824,13 @@ static void lock_fit(struct game_capture *gc)
 		const uint32_t oldest = (newest + LOCK_FIT_N - (n - 1)) % LOCK_FIT_N;
 		gc->lock.span_ns = t0 - gc->lock.times[oldest];
 	}
-	if (n < LOCK_FIT_MIN) {
+	if (n < LOCK_FIT_MIN ||
+	    (gc->lock.carried && n < LOCK_FIT_N && gc->lock.span_ns < LOCK_ENGAGE_SPAN_NS)) {
 		/* re-anchored: the carried period, the anchor on the mean of what
-		 * the window holds so far */
+		 * the window holds so far (Phase 6: until the window is as mature
+		 * as the one the period came from; a 16-record fit across a burst
+		 * of missed vblanks once read 120 fps as 109 and hopped the
+		 * cadence) */
 		gc->lock.anchor_counter = c0;
 		gc->lock.anchor_ns = (double)t0 + (my - gc->lock.period_ns * mx);
 		return;
@@ -793,6 +846,7 @@ static void lock_fit(struct game_capture *gc)
 	gc->lock.anchor_counter = c0;
 	gc->lock.anchor_ns = (double)t0 + (my - gc->lock.period_ns * mx);
 	gc->lock.ready = gc->lock.period_ns > 1000000.0; /* a sane clock runs slower than 1000 fps */
+	gc->lock.carried = false;
 	/* mature: a window spanning a second, or a full one (a fast game fills
 	 * it sooner) */
 	if (gc->lock.ready && (gc->lock.span_ns >= LOCK_ENGAGE_SPAN_NS || n >= LOCK_FIT_N))
