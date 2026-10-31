@@ -195,6 +195,7 @@ static void *gpu_encode_thread(void *data)
 
 			lock_key = next_key;
 
+			retime_mark_frame(encoder, timestamp, pts);
 			encoder->cur_pts += encoder->timebase_num * encoder->frame_rate_divisor;
 		}
 

@@ -51,6 +51,7 @@
 #define MICROSECOND_DEN 1000000
 #define NUM_ENCODE_TEXTURES 10
 #define NUM_ENCODE_TEXTURE_FRAMES_TO_WAIT 1
+#define RETIME_HIST 512 /* Phase 5b: video frames of (timestamp, pts) history, 8.5 s at 60 fps */
 
 static inline int64_t packet_dts_usec(struct encoder_packet *packet)
 {
@@ -1452,6 +1453,15 @@ struct obs_encoder {
 	double retime_drift;            /* filtered lag of the audio behind the video file time, s */
 	double retime_max_drift;
 	int retime_delta;               /* samples per second currently added (negative: removed) */
+	/* video encoders: the (frame timestamp, pts) of the last RETIME_HIST
+	 * frames sent to the encoder, so that the audio can look up the file
+	 * time of its own timestamps (retime_file_time) instead of comparing
+	 * arrival order, which the audio buffering and the encode queues move */
+	struct retime_mark {
+		uint64_t ts;
+		int64_t pts;
+	} retime_hist[RETIME_HIST];
+	volatile long retime_hist_n; /* marks written so far */
 
 	struct deque audio_input_buffer[MAX_AV_PLANES];
 	uint8_t *audio_output_buffer[MAX_AV_PLANES];
@@ -1508,6 +1518,7 @@ extern void stop_gpu_encode(obs_encoder_t *encoder);
 
 extern bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame, const uint64_t *frame_cts);
 extern int64_t video_frame_pts(struct obs_encoder *encoder, uint64_t timestamp);
+extern void retime_mark_frame(struct obs_encoder *encoder, uint64_t timestamp, int64_t pts);
 extern void send_off_encoder_packet(obs_encoder_t *encoder, bool success, bool received, struct encoder_packet *pkt);
 
 void obs_encoder_destroy(obs_encoder_t *encoder);
