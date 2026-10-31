@@ -539,19 +539,50 @@ static inline bool init_shared_info(size_t size, HWND window)
 	return true;
 }
 
+uint32_t capture_ring_next_slot = 0;
+
+uint32_t capture_ring_size_wanted(void)
+{
+	uint32_t n = global_hook_info ? global_hook_info->frame_ring_size : 1;
+
+	if (n < 1)
+		n = 1;
+	if (n > FRAME_RING_MAX)
+		n = FRAME_RING_MAX;
+	return n;
+}
+
 bool capture_init_shtex(struct shtex_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t format, bool flip,
 			uintptr_t handle)
 {
+	return capture_init_shtex_ring(data, window, cx, cy, format, flip, &handle, 1);
+}
+
+bool capture_init_shtex_ring(struct shtex_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t format,
+			     bool flip, const uintptr_t *handles, uint32_t count)
+{
+	if (count < 1 || count > FRAME_RING_MAX) {
+		hlog("capture_init_shtex: invalid ring size %u", count);
+		return false;
+	}
+
 	if (!init_shared_info(sizeof(struct shtex_data), window)) {
 		hlog("capture_init_shtex: Failed to initialize memory");
 		return false;
 	}
 
 	*data = shmem_info;
-	(*data)->tex_handle = (uint32_t)handle;
+	(*data)->tex_handle = (uint32_t)handles[0];
 	(*data)->log_version = SHTEX_LOG_VERSION;
 	(*data)->present_count = 0;
-	hlog("frame-lock present log v%d ready (%d records)", (int)SHTEX_LOG_VERSION, (int)PRESENT_LOG_SIZE);
+	(*data)->ring_size = count;
+	(*data)->read_slot = FRAME_RING_NONE;
+	(*data)->conflicts = 0;
+	for (uint32_t i = 0; i < count; i++)
+		(*data)->tex_handles[i] = (uint32_t)handles[i];
+	capture_ring_next_slot = 0;
+	hlog("frame-lock present log v%d ready (%d records, ring of %u slot%s)", (int)SHTEX_LOG_VERSION,
+	     (int)PRESENT_LOG_SIZE, count, count == 1 ? "" : "s");
 
 	global_hook_info->hook_ver_major = HOOK_VER_MAJOR;
 	global_hook_info->hook_ver_minor = HOOK_VER_MINOR;

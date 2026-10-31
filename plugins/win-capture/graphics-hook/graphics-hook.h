@@ -73,6 +73,11 @@ extern bool rehook_gl(void);
 
 extern bool capture_init_shtex(struct shtex_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t format,
 			       bool flip, uintptr_t handle);
+/* frame-locked capture: same, with a ring of count shared textures (1..FRAME_RING_MAX) */
+extern bool capture_init_shtex_ring(struct shtex_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t format,
+				    bool flip, const uintptr_t *handles, uint32_t count);
+/* frame-locked capture: slots to allocate for the next capture init, from hook_info (1..FRAME_RING_MAX) */
+extern uint32_t capture_ring_size_wanted(void);
 extern bool capture_init_shmem(struct shmem_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t pitch,
 			       uint32_t format, bool flip);
 extern void capture_free(void);
@@ -98,12 +103,34 @@ static inline void *get_offset_addr(HMODULE module, uint32_t offset)
 	return (void *)((uintptr_t)module + (uintptr_t)offset);
 }
 
+/* Frame-locked capture: ring slot the next frame goes into.  Without a ring this
+ * is always 0.  With a ring the slots are used round-robin, except that the slot
+ * OBS reports it is showing (read_slot) is stepped over, so the hook never
+ * overwrites what OBS draws and never waits for it. */
+extern uint32_t capture_ring_next_slot;
+
+static inline uint32_t capture_next_slot(struct shtex_data *shtex)
+{
+	uint32_t slot;
+
+	if (!shtex || shtex->ring_size <= 1)
+		return 0;
+
+	slot = capture_ring_next_slot % shtex->ring_size;
+	if (slot == shtex->read_slot) {
+		slot = (slot + 1) % shtex->ring_size;
+		InterlockedIncrement64((volatile LONG64 *)&shtex->conflicts);
+	}
+	capture_ring_next_slot = (slot + 1) % shtex->ring_size;
+	return slot;
+}
+
 /* Frame-locked capture: record one copied frame in the shared present log (see
  * struct shtex_data).  Called by a capture path right after it copied the frame
- * into the shared texture.  The record is written first and the count published
- * last with an interlocked store, so the OBS side never reads a half-written
- * record and the 64-bit count stays atomic from the 32-bit hook as well. */
-static inline void capture_log_present(struct shtex_data *shtex)
+ * into the shared texture slot.  The record is written first and the count
+ * published last with an interlocked store, so the OBS side never reads a
+ * half-written record and the 64-bit count stays atomic from the 32-bit hook. */
+static inline void capture_log_present(struct shtex_data *shtex, uint32_t slot)
 {
 	uint64_t n;
 	struct present_record *rec;
@@ -115,6 +142,7 @@ static inline void capture_log_present(struct shtex_data *shtex)
 	rec = &shtex->present_log[n % PRESENT_LOG_SIZE];
 	rec->time_ns = os_gettime_ns();
 	rec->counter = n + 1;
+	rec->slot = slot;
 	InterlockedExchange64((volatile LONG64 *)&shtex->present_count, (LONG64)(n + 1));
 }
 
