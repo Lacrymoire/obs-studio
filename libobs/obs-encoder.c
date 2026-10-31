@@ -1904,18 +1904,30 @@ static const char *receive_audio_name = "receive_audio";
  * when the audio started.  The lag is filtered over about two seconds and
  * corrected over the next second, at most one percent; a 59.8 fps game needs
  * about 160 of 48000 samples removed per second (0.3 %, six cents of pitch). */
+/* The marks and the lookups use pause-adjusted time (the raw timestamp less
+ * the encoder's pause offset, the same value for the video and the audio
+ * encoders of an output), so a pause is not a gap in either timeline. */
 void retime_mark_frame(struct obs_encoder *encoder, uint64_t timestamp, int64_t pts)
 {
 	long n = os_atomic_load_long(&encoder->retime_hist_n);
 	struct retime_mark *m = &encoder->retime_hist[n % RETIME_HIST];
-	m->ts = timestamp;
+	uint64_t paused;
+
+	pthread_mutex_lock(&encoder->pause.mutex);
+	paused = encoder->pause.ts_offset;
+	pthread_mutex_unlock(&encoder->pause.mutex);
+
+	m->ts = timestamp > paused ? timestamp - paused : 0;
 	m->pts = pts;
 	os_atomic_set_long(&encoder->retime_hist_n, n + 1);
 }
 
-/* The video file time (seconds of pts) at the real time ts, from the paired
- * video encoder's history: interpolated between the frames around ts,
- * extrapolated at real-time rate beyond the ends.  False with no history. */
+#define RETIME_MAX_EXTRAPOLATE_NS 1000000000ULL
+
+/* The video file time (seconds of pts) at the pause-adjusted time ts, from
+ * the paired video encoder's history: interpolated between the frames around
+ * ts, extrapolated at real-time rate up to a second beyond the ends.  False
+ * with no history or farther from it than that (a gap in the video). */
 static bool retime_file_time(struct obs_encoder *venc, uint64_t ts, double *out)
 {
 	const double den = (double)venc->timebase_den;
@@ -1934,8 +1946,10 @@ static bool retime_file_time(struct obs_encoder *venc, uint64_t ts, double *out)
 			if (next && next->ts > m->ts) {
 				double tn = (double)next->pts / den;
 				t += (tn - t) * (double)(ts - m->ts) / (double)(next->ts - m->ts);
-			} else {
+			} else if (ts - m->ts <= RETIME_MAX_EXTRAPOLATE_NS) {
 				t += (double)(ts - m->ts) * 1e-9;
+			} else {
+				return false;
 			}
 			*out = t;
 			return true;
@@ -1943,6 +1957,8 @@ static bool retime_file_time(struct obs_encoder *venc, uint64_t ts, double *out)
 		next = m;
 	}
 	/* ts is older than the whole history: extrapolate back from its oldest mark */
+	if (next->ts - ts > RETIME_MAX_EXTRAPOLATE_NS)
+		return false;
 	*out = (double)next->pts / den - (double)(next->ts - ts) * 1e-9;
 	return true;
 }
@@ -1966,7 +1982,7 @@ static void retime_reset(struct obs_encoder *encoder)
 	encoder->retime_delta = 0;
 }
 
-static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio, uint64_t raw_ts)
+static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio)
 {
 	struct obs_encoder *venc;
 	uint8_t *output[MAX_AV_PLANES] = {0};
@@ -1982,12 +1998,13 @@ static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio, 
 	venc = obs_weak_encoder_get_encoder(encoder->paired_encoders.array[0]);
 	if (!venc)
 		return;
-	/* the video file time at this chunk's own (real) timestamp, so that the
-	 * audio pipeline delay, which OBS raises when a source lags (audio
-	 * buffering), and the encoder queues do not read as lag */
-	have_vtime = retime_file_time(venc, raw_ts, &vtime);
+	/* the video file time at this chunk's own timestamp (pause-adjusted by
+	 * audio_pause_check, as the marks are), so that the audio pipeline
+	 * delay, which OBS raises when a source lags (audio buffering), and the
+	 * encoder queues do not read as lag */
+	have_vtime = retime_file_time(venc, audio->timestamp, &vtime);
 	obs_encoder_release(venc);
-	if (!have_vtime)
+	if (!have_vtime && !encoder->retime_rs)
 		return; /* no video frame yet: this chunk passes unchanged */
 
 	if (!encoder->retime_rs) {
@@ -2004,10 +2021,14 @@ static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio, 
 	}
 
 	atime = (double)encoder->retime_out / (double)encoder->samplerate;
-	drift = (vtime - encoder->retime_v0) - atime; /* > 0: the audio is behind the video file time */
-	encoder->retime_drift += (drift - encoder->retime_drift) * 0.01;
-	if (fabs(encoder->retime_drift) > encoder->retime_max_drift)
-		encoder->retime_max_drift = fabs(encoder->retime_drift);
+	if (have_vtime) {
+		drift = (vtime - encoder->retime_v0) - atime; /* > 0: the audio is behind the video file time */
+		encoder->retime_drift += (drift - encoder->retime_drift) * 0.01;
+		if (fabs(encoder->retime_drift) > encoder->retime_max_drift)
+			encoder->retime_max_drift = fabs(encoder->retime_drift);
+	} else {
+		drift = encoder->retime_drift; /* a gap in the video: keep the current trim */
+	}
 
 	/* add (remove) the filtered lag over the next second, at most one percent */
 	limit = (int)encoder->samplerate / 100;
@@ -2055,7 +2076,7 @@ static void receive_audio(void *param, size_t mix_idx, struct audio_data *in)
 	/* Phase 5b: once the audio has started (start_ts set by the first
 	 * chunk), follow the video file time */
 	if (encoder->retime && encoder->start_ts)
-		retime_audio(encoder, &audio, in->timestamp);
+		retime_audio(encoder, &audio);
 
 	if (!buffer_audio(encoder, &audio))
 		goto end;
