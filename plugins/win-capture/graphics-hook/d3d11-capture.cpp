@@ -13,35 +13,42 @@ struct d3d11_data {
 	bool using_shtex;
 	bool multisampled;
 
-	union {
-		/* shared texture */
-		struct {
-			struct shtex_data *shtex_info;
-			ID3D11Texture2D *texture;
-			HANDLE handle;
-		};
-		/* shared memory */
-		struct {
-			ID3D11Texture2D *copy_surfaces[NUM_BUFFERS];
-			bool texture_ready[NUM_BUFFERS];
-			bool texture_mapped[NUM_BUFFERS];
-			uint32_t pitch;
-			struct shmem_data *shmem_info;
-			int cur_tex;
-			int copy_wait;
-		};
-	};
+	/* shared texture(s): frame-locked capture uses a ring of ring_size
+	 * slots, one shared texture each (see struct shtex_data) */
+	struct shtex_data *shtex_info;
+	ID3D11Texture2D *texture[FRAME_RING_MAX];
+	HANDLE handle[FRAME_RING_MAX];
+	uint32_t ring_size;
+
+	/* shared memory */
+	ID3D11Texture2D *copy_surfaces[NUM_BUFFERS];
+	bool texture_ready[NUM_BUFFERS];
+	bool texture_mapped[NUM_BUFFERS];
+	uint32_t pitch;
+	struct shmem_data *shmem_info;
+	int cur_tex;
+	int copy_wait;
 };
 
 static struct d3d11_data data = {};
+
+/* true once d3d11_init() finished: slot 0 of the ring exists, or in shared
+ * memory mode the last copy surface (the stock code read the latter through
+ * a union alias of the handle) */
+static inline bool d3d11_initialized(void)
+{
+	return data.using_shtex ? data.handle[0] != nullptr : data.copy_surfaces[NUM_BUFFERS - 1] != nullptr;
+}
 
 void d3d11_free(void)
 {
 	capture_free();
 
 	if (data.using_shtex) {
-		if (data.texture) {
-			data.texture->Release();
+		for (uint32_t i = 0; i < FRAME_RING_MAX; i++) {
+			if (data.texture[i]) {
+				data.texture[i]->Release();
+			}
 		}
 	} else {
 		for (size_t i = 0; i < NUM_BUFFERS; i++) {
@@ -194,22 +201,25 @@ static bool d3d11_shmem_init(HWND window)
 
 static bool d3d11_shtex_init(HWND window)
 {
-	bool success;
+	uintptr_t handles[FRAME_RING_MAX];
 
 	data.using_shtex = true;
+	data.ring_size = capture_ring_size_wanted();
 
-	success = create_d3d11_tex(data.cx, data.cy, &data.texture, &data.handle);
-
-	if (!success) {
-		hlog("d3d11_shtex_init: failed to create texture");
+	/* frame-locked capture: one shared texture per ring slot */
+	for (uint32_t i = 0; i < data.ring_size; i++) {
+		if (!create_d3d11_tex(data.cx, data.cy, &data.texture[i], &data.handle[i])) {
+			hlog("d3d11_shtex_init: failed to create texture (slot %u of %u)", i, data.ring_size);
+			return false;
+		}
+		handles[i] = (uintptr_t)data.handle[i];
+	}
+	if (!capture_init_shtex_ring(&data.shtex_info, window, data.cx, data.cy, data.format, false, handles,
+				     data.ring_size)) {
 		return false;
 	}
-	if (!capture_init_shtex(&data.shtex_info, window, data.cx, data.cy, data.format, false,
-				(uintptr_t)data.handle)) {
-		return false;
-	}
 
-	hlog("d3d11 shared texture capture successful");
+	hlog("d3d11 shared texture capture successful (%u slot%s)", data.ring_size, data.ring_size == 1 ? "" : "s");
 	return true;
 }
 
@@ -250,9 +260,16 @@ static inline void d3d11_copy_texture(ID3D11Resource *dst, ID3D11Resource *src)
 
 static inline void d3d11_shtex_capture(ID3D11Resource *backbuffer)
 {
-	if (data.texture) {
-		d3d11_copy_texture(data.texture, backbuffer);
+	if (!data.texture[0]) {
+		return;
 	}
+
+	/* frame-locked capture: copy this present into the next free ring slot
+	 * and record (counter, present time, slot) in the shared present log,
+	 * exactly as the D3D9 path does */
+	const uint32_t slot = capture_next_slot(data.shtex_info);
+	d3d11_copy_texture(data.texture[slot], backbuffer);
+	capture_log_present(data.shtex_info, slot);
 }
 
 static void d3d11_shmem_capture_copy(int i)
@@ -306,7 +323,7 @@ void d3d11_capture(void *swap_ptr, void *backbuffer_ptr)
 	if (capture_should_init()) {
 		d3d11_init(swap);
 	}
-	if (data.handle != nullptr && capture_ready()) {
+	if (d3d11_initialized() && capture_ready()) {
 		ID3D11Resource *backbuffer;
 
 		hr = dxgi_backbuffer->QueryInterface(__uuidof(ID3D11Resource), (void **)&backbuffer);

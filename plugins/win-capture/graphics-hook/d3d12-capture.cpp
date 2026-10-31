@@ -30,15 +30,15 @@ struct d3d12_data {
 	ID3D11DeviceContext *context11;
 	ID3D11On12Device *device11on12;
 
-	union {
-		struct {
-			struct shtex_data *shtex_info;
-			UINT backbuffer_count;
-			UINT cur_backbuffer;
-			ID3D11Texture2D *copy_tex;
-			HANDLE handle;
-		};
-	};
+	struct shtex_data *shtex_info;
+	UINT backbuffer_count;
+	UINT cur_backbuffer;
+
+	/* shared texture(s): frame-locked capture uses a ring of ring_size
+	 * slots, one shared 11on12 texture each (see struct shtex_data) */
+	ID3D11Texture2D *copy_tex[FRAME_RING_MAX];
+	HANDLE handle[FRAME_RING_MAX];
+	uint32_t ring_size;
 };
 
 static struct d3d12_data data = {};
@@ -50,8 +50,10 @@ extern bool dxgi_present_attempted;
 
 void d3d12_free(void)
 {
-	if (data.copy_tex) {
-		data.copy_tex->Release();
+	for (uint32_t i = 0; i < FRAME_RING_MAX; i++) {
+		if (data.copy_tex[i]) {
+			data.copy_tex[i]->Release();
+		}
 	}
 	if (data.device11) {
 		data.device11->Release();
@@ -90,26 +92,30 @@ static bool create_d3d12_tex(UINT count)
 	desc11.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 	desc11.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
-	hr = data.device11->CreateTexture2D(&desc11, nullptr, &data.copy_tex);
-	if (FAILED(hr)) {
-		hlog_hr("create_d3d12_tex: creation of d3d11 copy tex failed", hr);
-		return false;
-	}
+	/* frame-locked capture: one shared texture per ring slot */
+	for (uint32_t i = 0; i < data.ring_size; i++) {
+		hr = data.device11->CreateTexture2D(&desc11, nullptr, &data.copy_tex[i]);
+		if (FAILED(hr)) {
+			hlog_hr("create_d3d12_tex: creation of d3d11 copy tex failed", hr);
+			hlog("create_d3d12_tex: slot %u of %u", i, data.ring_size);
+			return false;
+		}
 
-	IDXGIResource *dxgi_res;
-	hr = data.copy_tex->QueryInterface(&dxgi_res);
-	if (FAILED(hr)) {
-		hlog_hr("create_d3d12_tex: failed to query "
-			"IDXGIResource interface from texture",
-			hr);
-		return false;
-	}
+		IDXGIResource *dxgi_res;
+		hr = data.copy_tex[i]->QueryInterface(&dxgi_res);
+		if (FAILED(hr)) {
+			hlog_hr("create_d3d12_tex: failed to query "
+				"IDXGIResource interface from texture",
+				hr);
+			return false;
+		}
 
-	hr = dxgi_res->GetSharedHandle(&data.handle);
-	dxgi_res->Release();
-	if (FAILED(hr)) {
-		hlog_hr("create_d3d12_tex: failed to get shared handle", hr);
-		return false;
+		hr = dxgi_res->GetSharedHandle(&data.handle[i]);
+		dxgi_res->Release();
+		if (FAILED(hr)) {
+			hlog_hr("create_d3d12_tex: failed to get shared handle", hr);
+			return false;
+		}
 	}
 
 	return true;
@@ -183,18 +189,25 @@ static bool d3d12_init_11on12(ID3D12Device *device)
 
 static bool d3d12_shtex_init(ID3D12Device *device, HWND window, UINT count)
 {
+	uintptr_t handles[FRAME_RING_MAX];
+
+	data.ring_size = capture_ring_size_wanted();
+
 	if (!d3d12_init_11on12(device)) {
 		return false;
 	}
 	if (!create_d3d12_tex(count)) {
 		return false;
 	}
-	if (!capture_init_shtex(&data.shtex_info, window, data.cx, data.cy, data.format, false,
-				(uintptr_t)data.handle)) {
+	for (uint32_t i = 0; i < data.ring_size; i++) {
+		handles[i] = (uintptr_t)data.handle[i];
+	}
+	if (!capture_init_shtex_ring(&data.shtex_info, window, data.cx, data.cy, data.format, false, handles,
+				     data.ring_size)) {
 		return false;
 	}
 
-	hlog("d3d12 shared texture capture successful");
+	hlog("d3d12 shared texture capture successful (%u slot%s)", data.ring_size, data.ring_size == 1 ? "" : "s");
 	return true;
 }
 
@@ -299,10 +312,16 @@ static inline void d3d12_shtex_capture(IDXGISwapChain *swap)
 		if (SUCCEEDED(data.device11on12->CreateWrappedResource(
 			    backbuffer12, &rf11, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT,
 			    IID_PPV_ARGS(&backbuffer)))) {
+			/* frame-locked capture: copy this present into the next
+			 * free ring slot and record (counter, present time,
+			 * slot) in the shared present log, as the D3D9 path does */
+			const uint32_t slot = capture_next_slot(data.shtex_info);
+
 			data.device11on12->AcquireWrappedResources(&backbuffer, 1);
-			d3d12_copy_texture(data.copy_tex, backbuffer);
+			d3d12_copy_texture(data.copy_tex[slot], backbuffer);
 			data.device11on12->ReleaseWrappedResources(&backbuffer, 1);
 			data.context11->Flush();
+			capture_log_present(data.shtex_info, slot);
 
 			if (!dxgi_1_4) {
 				if (++data.cur_backbuffer >= data.backbuffer_count) {
@@ -327,7 +346,7 @@ void d3d12_capture(void *swap_ptr, void *)
 	if (capture_should_init()) {
 		d3d12_init(swap);
 	}
-	if (data.handle != nullptr && capture_ready()) {
+	if (data.handle[0] != nullptr && capture_ready()) {
 		d3d12_shtex_capture(swap);
 	}
 }
