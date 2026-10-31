@@ -240,6 +240,7 @@ struct game_capture {
 		uint64_t last_time_ns;
 		uint64_t resets;
 		bool active;             /* a frame has been chosen by the timeline */
+		uint64_t shown;          /* the frame chosen last tick */
 		double pos;              /* position of the chosen frame within its tick window */
 		double smooth_ns;        /* smoothed present time of the shown frame */
 		uint64_t repeats, skips, starved, lagged;
@@ -495,10 +496,11 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 	const uint64_t delay_ns = (uint64_t)gc->config.buffer_delay * obs_get_frame_interval_ns();
 	const double target = (double)(int64_t)(tick_ns - delay_ns);
 	const double x = (double)(int64_t)gc->lock.anchor_counter + (target - gc->lock.anchor_ns) / gc->lock.period_ns;
+	const bool was_active = gc->lock.active;
 	const uint64_t prev = gc->lock.shown;
 	uint64_t c;
 
-	if (!gc->lock.active) {
+	if (!was_active) {
 		/* first choice on this clock: the frame due at the target time */
 		c = x > 0.0 ? (uint64_t)x : 0;
 		gc->lock.active = true;
@@ -524,7 +526,7 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
 		c = newest; /* the game has not presented it yet */
 		gc->lock.starved++;
 	}
-	if (c < oldest && !(gc->lock.active && c == prev)) {
+	if (c < oldest && !(was_active && c == prev)) {
 		/* switching to a frame whose slot the hook may be rewriting; the
 		 * frame shown last tick is safe, its slot is read_slot */
 		c = oldest;
