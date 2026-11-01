@@ -760,13 +760,50 @@ static void gl_capture(HDC hdc)
 	}
 }
 
+static struct hook_in_front swap_front;
+static struct hook_in_front wgl_swap_front;
+static struct hook_in_front wgl_swap_layer_front;
+static bool front_checked_active = false;
+
+/* at every swap the capture copied: (re)check who is in front of our hooks
+ * when a capture has just started (see graphics-hook.h) */
+static inline void gl_front_check(void)
+{
+	const bool now = capture_active();
+	if (now && !front_checked_active) {
+		hook_in_front_install(&swap_front);
+		hook_in_front_install(&wgl_swap_front);
+		hook_in_front_install(&wgl_swap_layer_front);
+	}
+	front_checked_active = now;
+}
+
 static inline void gl_swap_begin(HDC hdc)
 {
 	const bool first = swap_recurse == 0;
 	++swap_recurse;
 
-	if (first && !global_hook_info->capture_overlay)
+	if (first && !global_hook_info->capture_overlay && captured_in_front == 0) {
 		gl_capture(hdc);
+		gl_front_check();
+	}
+}
+
+/* the copy for a swap whose hook we got in front of */
+static inline bool gl_swap_front_begin(HDC hdc)
+{
+	if (captured_in_front != 0 || swap_recurse != 0 || global_hook_info->capture_overlay)
+		return false;
+
+	gl_capture(hdc);
+	++captured_in_front;
+	return true;
+}
+
+static inline void gl_swap_front_end(bool took)
+{
+	if (took)
+		--captured_in_front;
 }
 
 static inline void gl_swap_end(HDC hdc)
@@ -808,6 +845,30 @@ static BOOL WINAPI hook_wgl_swap_layer_buffers(HDC hdc, UINT planes)
 
 	gl_swap_end(hdc);
 
+	return ret;
+}
+
+static BOOL WINAPI hook_swap_buffers_front(HDC hdc)
+{
+	const bool took = gl_swap_front_begin(hdc);
+	const BOOL ret = ((PFN_SwapBuffers)swap_front.real)(hdc);
+	gl_swap_front_end(took);
+	return ret;
+}
+
+static BOOL WINAPI hook_wgl_swap_buffers_front(HDC hdc)
+{
+	const bool took = gl_swap_front_begin(hdc);
+	const BOOL ret = ((PFN_WglSwapBuffers)wgl_swap_front.real)(hdc);
+	gl_swap_front_end(took);
+	return ret;
+}
+
+static BOOL WINAPI hook_wgl_swap_layer_buffers_front(HDC hdc, UINT planes)
+{
+	const bool took = gl_swap_front_begin(hdc);
+	const BOOL ret = ((PFN_WglSwapLayerBuffers)wgl_swap_layer_front.real)(hdc, planes);
+	gl_swap_front_end(took);
 	return ret;
 }
 
@@ -888,6 +949,23 @@ bool hook_gl(void)
 	const LONG error = DetourTransactionCommit();
 	const bool success = error == NO_ERROR;
 	if (success) {
+		swap_front.target = (void *)SwapBuffers;
+		swap_front.inner = (void *)hook_swap_buffers;
+		swap_front.outer = (void *)hook_swap_buffers_front;
+		swap_front.name = "SwapBuffers";
+		if (wgl_sb_proc) {
+			wgl_swap_front.target = wgl_sb_proc;
+			wgl_swap_front.inner = (void *)hook_wgl_swap_buffers;
+			wgl_swap_front.outer = (void *)hook_wgl_swap_buffers_front;
+			wgl_swap_front.name = "wglSwapBuffers";
+		}
+		if (wgl_slb_proc) {
+			wgl_swap_layer_front.target = wgl_slb_proc;
+			wgl_swap_layer_front.inner = (void *)hook_wgl_swap_layer_buffers;
+			wgl_swap_layer_front.outer = (void *)hook_wgl_swap_layer_buffers_front;
+			wgl_swap_layer_front.name = "wglSwapLayerBuffers";
+		}
+
 		hlog("Hooked SwapBuffers");
 		if (RealWglDeleteContext)
 			hlog("Hooked wglDeleteContext");

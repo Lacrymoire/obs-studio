@@ -1,6 +1,9 @@
 #include <windows.h>
 #include <psapi.h>
 #include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+#include <detours.h>
 #include "graphics-hook.h"
 #ifdef OBS_LEGACY
 #include "../graphics-hook-ver.h"
@@ -857,6 +860,114 @@ static bool init_dll(void)
 
 	dup_hook_mutex = create_mutex_plus_id(HOOK_NAME, pid);
 	return !!dup_hook_mutex;
+}
+
+/* ------------------------------------------------------------------------- */
+/* hooking in front of another hook (see graphics-hook.h)                    */
+
+__declspec(thread) int captured_in_front = 0;
+
+static bool code_readable(const void *p, size_t n)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+	    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+		return false;
+	return (const uint8_t *)p + n <= (const uint8_t *)mbi.BaseAddress + mbi.RegionSize;
+}
+
+/* the first instruction of a function somebody detoured is a jump (RTSS
+ * patches entry points this way, Detours too, sometimes through a near
+ * stub, and an incremental link reaches functions through jump thunks) */
+static const void *jump_target(const uint8_t *p)
+{
+	if (!code_readable(p, 12))
+		return NULL;
+	if (p[0] == 0xE9) /* jmp rel32 */
+		return p + 5 + *(const int32_t *)(p + 1);
+	if (p[0] == 0xFF && p[1] == 0x25) { /* jmp [mem] */
+#ifdef _WIN64
+		const void *const *slot = (const void *const *)(p + 6 + *(const int32_t *)(p + 2));
+#else
+		const void *const *slot = (const void *const *)(uintptr_t)(*(const uint32_t *)(p + 2));
+#endif
+		return code_readable(slot, sizeof(*slot)) ? *slot : NULL;
+	}
+	if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) /* mov rax, imm64; jmp rax */
+		return *(const void *const *)(p + 2);
+	if (p[0] == 0x68 && p[5] == 0xC3) /* push imm32; ret */
+		return (const void *)(uintptr_t)(*(const uint32_t *)(p + 1));
+	return NULL;
+}
+
+/* follow entry jumps to where the code really goes */
+const void *hook_follow_jumps(const void *fn)
+{
+	const void *cur = fn;
+	for (int hops = 0; hops < 4 && cur; hops++) {
+		const void *next = jump_target(cur);
+		if (!next)
+			break;
+		cur = next;
+	}
+	return cur ? cur : fn;
+}
+
+const char *hook_module_name(const void *addr, char *buf, size_t size)
+{
+	HMODULE mod = NULL;
+	wchar_t path[MAX_PATH];
+
+	if (addr &&
+	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCWSTR)addr, &mod) &&
+	    GetModuleFileNameW(mod, path, MAX_PATH)) {
+		const wchar_t *base = wcsrchr(path, L'\\');
+		snprintf(buf, size, "%ls", base ? base + 1 : path);
+	} else {
+		snprintf(buf, size, "an unknown module");
+	}
+	return buf;
+}
+
+void hook_in_front_install(struct hook_in_front *h)
+{
+	char m[64];
+
+	if (!h->target || !h->inner || !h->outer || h->failed)
+		return;
+
+	const void *first = hook_follow_jumps(h->target);
+	if (first == hook_follow_jumps(h->inner)) {
+		if (!h->checked)
+			hlog("frame-lock: %s: our hook is first in line, nothing draws in front of it", h->name);
+		h->checked = true;
+		return;
+	}
+	if (h->real) {
+		if (first != hook_follow_jumps(h->outer))
+			hlog("frame-lock: %s: %s hooked in front of us again after the capture started; its overlay "
+			     "stays in the capture until the game restarts",
+			     h->name, hook_module_name(first, m, sizeof(m)));
+		return;
+	}
+
+	hlog("frame-lock: %s: %s runs before our hook; hooking in front of it", h->name,
+	     hook_module_name(first, m, sizeof(m)));
+
+	h->real = h->target;
+	DetourTransactionBegin();
+	DetourAttach(&h->real, h->outer);
+	const LONG error = DetourTransactionCommit();
+	if (error != NO_ERROR) {
+		hlog("frame-lock: %s: could not hook in front (%ld); overlays drawn there stay in the capture", h->name,
+		     error);
+		h->real = NULL;
+		h->failed = true;
+		return;
+	}
+	hlog("frame-lock: %s: hooked in front; third-party overlays drawn there are left out of the capture",
+	     h->name);
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID unused1)

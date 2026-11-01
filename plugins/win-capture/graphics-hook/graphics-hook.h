@@ -297,6 +297,35 @@ static inline bool capture_should_init(void)
 extern __declspec(thread) int vk_presenting;
 #endif
 
+/* ------------------------------------------------------------------------- */
+/* hooking in front of another hook (third-party overlay exclusion)          */
+
+/* RTSS and the like draw their on-screen display from a hook on the same
+ * present function we detour.  Whoever patched the entry last runs first,
+ * so with their hook in front of ours the overlay is on the back buffer
+ * before we copy it, and only a late hook (slow hook rate) used to avoid
+ * that.  When a capture starts with "Capture third-party overlays" off,
+ * hook_in_front_install() looks at the entry of the function we hooked: if
+ * it no longer runs into our detour first, we detour it once more (Detours
+ * follows the entry jump and patches whoever is in front), so `outer` runs
+ * before them, copies the frame and raises captured_in_front for the rest
+ * of the call; the original detour then skips its copy. */
+struct hook_in_front {
+	void *target; /* the function we hooked (its real entry) */
+	void *inner;  /* our original detour on it */
+	void *outer;  /* detour to put in front of whoever patched over ours */
+	void *real;   /* trampoline for outer; NULL until installed */
+	const char *name;
+	bool checked; /* "first in line" already logged */
+	bool failed;
+};
+
+extern __declspec(thread) int captured_in_front;
+
+extern const void *hook_follow_jumps(const void *fn);
+extern const char *hook_module_name(const void *addr, char *buf, size_t size);
+extern void hook_in_front_install(struct hook_in_front *h);
+
 static inline bool should_passthrough()
 {
 #if COMPILE_VULKAN_HOOK

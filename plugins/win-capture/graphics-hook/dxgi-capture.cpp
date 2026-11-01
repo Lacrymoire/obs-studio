@@ -32,6 +32,39 @@ struct dxgi_swap_data {
 };
 
 static struct dxgi_swap_data data = {};
+
+static struct hook_in_front present_front = {};
+static struct hook_in_front present1_front = {};
+static bool front_checked_active = false;
+
+/* at every present the capture copied: (re)check who is in front of our
+ * hooks when a capture has just started */
+static inline void dxgi_front_check(void)
+{
+	const bool now = capture_active();
+	if (now && !front_checked_active) {
+		hook_in_front_install(&present_front);
+		hook_in_front_install(&present1_front);
+	}
+	front_checked_active = now;
+}
+
+/* the copy for a present whose hook we got in front of (see graphics-hook.h) */
+static inline bool dxgi_capture_in_front(IDXGISwapChain *swap, UINT flags)
+{
+	if (captured_in_front != 0 || global_hook_info->capture_overlay || should_passthrough())
+		return false;
+	if ((flags & DXGI_PRESENT_TEST) != 0 || swap != data.swap || !data.capture)
+		return false;
+
+	IUnknown *backbuffer = get_dxgi_backbuffer(swap);
+	if (!backbuffer)
+		return false;
+
+	data.capture(swap, backbuffer);
+	backbuffer->Release();
+	return true;
+}
 static int swap_chain_mismatch_count = 0;
 constexpr int swap_chain_mismtach_limit = 16;
 
@@ -211,13 +244,15 @@ static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_in
 		     ", expected_swap=0x%" PRIX64,
 		     sync_interval, flags, swap, data.swap);
 	const bool capture = !test_draw && swap == data.swap && data.capture;
-	if (capture && !capture_overlay) {
+	if (capture && !capture_overlay && captured_in_front == 0) {
 		IUnknown *backbuffer = get_dxgi_backbuffer(swap);
 
 		if (backbuffer) {
 			data.capture(swap, backbuffer);
 			backbuffer->Release();
 		}
+
+		dxgi_front_check();
 	}
 
 	++dxgi_presenting;
@@ -273,13 +308,15 @@ static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_
 		     ", expected_swap=0x%" PRIX64,
 		     sync_interval, flags, swap, data.swap);
 	const bool capture = !test_draw && swap == data.swap && !!data.capture;
-	if (capture && !capture_overlay) {
+	if (capture && !capture_overlay && captured_in_front == 0) {
 		IUnknown *backbuffer = get_dxgi_backbuffer(swap);
 
 		if (backbuffer) {
 			data.capture(swap, backbuffer);
 			backbuffer->Release();
 		}
+
+		dxgi_front_check();
 	}
 
 	++dxgi_presenting;
@@ -300,6 +337,29 @@ static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_
 		}
 	}
 
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hook_present_front(IDXGISwapChain *swap, UINT sync_interval, UINT flags)
+{
+	const bool took = dxgi_capture_in_front(swap, flags);
+	if (took)
+		++captured_in_front;
+	const HRESULT hr = ((present_t)present_front.real)(swap, sync_interval, flags);
+	if (took)
+		--captured_in_front;
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hook_present1_front(IDXGISwapChain1 *swap, UINT sync_interval, UINT flags,
+						     const DXGI_PRESENT_PARAMETERS *params)
+{
+	const bool took = dxgi_capture_in_front(swap, flags);
+	if (took)
+		++captured_in_front;
+	const HRESULT hr = ((present1_t)present1_front.real)(swap, sync_interval, flags, params);
+	if (took)
+		--captured_in_front;
 	return hr;
 }
 
@@ -336,6 +396,17 @@ bool hook_dxgi(void)
 	const LONG error = DetourTransactionCommit();
 	const bool success = error == NO_ERROR;
 	if (success) {
+		present_front.target = present_addr;
+		present_front.inner = (void *)hook_present;
+		present_front.outer = (void *)hook_present_front;
+		present_front.name = "IDXGISwapChain::Present";
+		if (present1_addr) {
+			present1_front.target = present1_addr;
+			present1_front.inner = (void *)hook_present1;
+			present1_front.outer = (void *)hook_present1_front;
+			present1_front.name = "IDXGISwapChain1::Present1";
+		}
+
 		hlog("Hooked IDXGISwapChain::Present");
 		hlog("Hooked IDXGISwapChain::ResizeBuffers");
 		if (RealPresent1) {
