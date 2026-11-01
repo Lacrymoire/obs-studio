@@ -173,6 +173,26 @@ struct game_capture_config {
 #define LOCK_WANDER_CALM_NS 20000000000ULL
 #define LOCK_WANDER_SPREAD 0.02
 #define LOCK_WANDER_STEP 0.20
+/* Phase 8 frame generation (lock_pace): DLSS frame generation presents a
+ * rendered frame and its generated frames in a burst (6x: six presents 0.4 to
+ * 0.6 ms apart every render interval), each with a flip delay the display
+ * engine honours, so the screen shows them evenly spaced.  The hook sees only
+ * the present times.  The pacer gives each present of a burst the time the
+ * display will show it at (less a constant): the first keeps its time, each
+ * further one lands one mean present interval after the one before (the mean
+ * of the last LOCK_BURST_WIN gaps: the render interval over the burst size).
+ * Burst mode begins when LOCK_BURST_ENTER of those gaps are shorter than
+ * LOCK_BURST_GAP x the mean (and than LOCK_BURST_GAP_MAX_NS) and ends when
+ * LOCK_BURST_EXIT or fewer are; a normal game's catch-up doubles never reach it.  In burst mode the frames
+ * are chosen by the paced times (lock_select_raw) unless the paced rate sits
+ * on a whole- or half-frame cadence (a capped game: 2x of 60, 6x of 20). */
+#define LOCK_BURST_WIN 24
+#define LOCK_BURST_GAP 0.3
+#define LOCK_BURST_GAP_MAX_NS 2500000.0 /* and short outright: a stall in the window does not make 8 ms gaps short */
+#define LOCK_BURST_ENTER 9  /* of LOCK_BURST_WIN (2x generation: half the gaps) */
+#define LOCK_BURST_EXIT 2   /* of LOCK_BURST_WIN */
+#define LOCK_BURST_CAP 4.0  /* a paced time at most this many mean intervals after the present */
+#define CADENCE_BURST_MAX_N 2
 /* Phase 6 cadence (see cadence_choose): m output ticks per n game frames */
 #define CADENCE_BAND 0.02      /* residual (paced tick rate / output rate - 1) a cadence may have to be chosen */
 #define CADENCE_KEEP 0.03      /* residual the current cadence may drift to before it is re-chosen */
@@ -323,6 +343,7 @@ struct game_capture {
 		uint64_t shown_v;        /* slot of the frame chosen last tick */
 		struct {
 			uint64_t counter, v;
+			uint64_t t; /* Phase 8: paced time (the present time unless a burst moved it) */
 		} vlog[PRESENT_LOG_SIZE]; /* slot of each present the ring read, by counter */
 		/* Phase 7 wandering rate (lock_wandering): the clock shifts on a
 		 * mature fit within the window, with the period in use at each */
@@ -333,6 +354,16 @@ struct game_capture {
 		uint64_t wander_last_ns; /* the last shift counted */
 		double wander_ref_ns;    /* period of the last mature fit (a step from it clears the shifts) */
 		uint64_t wander_ticks, wander_entries;
+		/* Phase 8 frame-generation bursts (lock_pace) */
+		uint64_t burst_gaps[LOCK_BURST_WIN];
+		bool burst_short[LOCK_BURST_WIN];
+		uint32_t burst_head, burst_n, burst_short_n;
+		uint64_t burst_sum;
+		double burst_step_ns;    /* mean gap over the window: the paced spacing */
+		bool burst;              /* burst mode: presents paced out, frames chosen by the paced times */
+		bool raw_now;            /* this tick chose by the paced/present times (no cadence) */
+		uint64_t burst_raw_last_ns, burst_paced_last_ns;
+		uint64_t burst_moved, burst_entries, burst_ticks;
 	} lock;
 
 	/* frame-locked capture: Phase 1 debug log state (see flog_tick) */
@@ -349,6 +380,7 @@ struct game_capture {
 		bool blocked_logged;
 		/* lock counters when the log opened, so the close line reports this recording only */
 		uint64_t repeats0, skips0, starved0, lagged0, resets0, reanchors0, misses0, wander_ticks0;
+		uint64_t burst_ticks0, burst_moved0;
 	} flog;
 
 	PFN_SetThreadDpiAwarenessContext set_thread_dpi_awareness_context;
@@ -535,8 +567,14 @@ static void lock_reopen(struct game_capture *gc)
 	const bool wander = gc->lock.wander;
 	const uint64_t wander_last_ns = gc->lock.wander_last_ns, wander_ticks = gc->lock.wander_ticks,
 		       wander_entries = gc->lock.wander_entries;
+	/* Phase 8: the burst statistics (the window itself belongs to the old stream) */
+	const uint64_t burst_moved = gc->lock.burst_moved, burst_entries = gc->lock.burst_entries,
+		       burst_ticks = gc->lock.burst_ticks;
 
 	memset(&gc->lock, 0, sizeof(gc->lock));
+	gc->lock.burst_moved = burst_moved;
+	gc->lock.burst_entries = burst_entries;
+	gc->lock.burst_ticks = burst_ticks;
 	gc->lock.wander = wander;
 	gc->lock.wander_last_ns = wander_last_ns;
 	gc->lock.wander_ticks = wander_ticks;
@@ -627,6 +665,82 @@ static inline uint64_t lock_v_of(const struct game_capture *gc, uint64_t counter
 			return gc->lock.vlog[i].v;
 	}
 	return counter + gc->lock.skew;
+}
+
+/* Phase 8: the paced time of a present the ring read (its present time unless
+ * a burst moved it); a counter the ring has not seen keeps the time given */
+static inline uint64_t lock_paced_time(const struct game_capture *gc, uint64_t counter, uint64_t time_ns)
+{
+	if (counter) {
+		const uint32_t i = (uint32_t)((counter - 1) % PRESENT_LOG_SIZE);
+		if (gc->lock.vlog[i].counter == counter && gc->lock.vlog[i].t)
+			return gc->lock.vlog[i].t;
+	}
+	return time_ns;
+}
+
+/* Phase 8 frame-generation bursts: see LOCK_BURST_*.  Returns the paced time
+ * of the present; the window and the mode are kept over refits (they describe
+ * the stream, not the fit) and cleared by lock_reopen (a new hook). */
+static uint64_t lock_pace(struct game_capture *gc, uint64_t time_ns)
+{
+	uint64_t paced = time_ns;
+
+	if (gc->lock.burst_raw_last_ns) {
+		/* (a present stamped no later than the one before: inside a burst) */
+		const uint64_t gap = time_ns > gc->lock.burst_raw_last_ns ? time_ns - gc->lock.burst_raw_last_ns : 0;
+		const uint32_t i = gc->lock.burst_head;
+		double mean;
+		bool is_short;
+
+		if (gc->lock.burst_n == LOCK_BURST_WIN) {
+			gc->lock.burst_sum -= gc->lock.burst_gaps[i];
+			if (gc->lock.burst_short[i])
+				gc->lock.burst_short_n--;
+		} else {
+			gc->lock.burst_n++;
+		}
+		gc->lock.burst_gaps[i] = gap;
+		gc->lock.burst_sum += gap;
+		mean = (double)gc->lock.burst_sum / (double)gc->lock.burst_n;
+		is_short = (double)gap < LOCK_BURST_GAP * mean && (double)gap < LOCK_BURST_GAP_MAX_NS;
+		gc->lock.burst_short[i] = is_short;
+		if (is_short)
+			gc->lock.burst_short_n++;
+		gc->lock.burst_head = (i + 1) % LOCK_BURST_WIN;
+		gc->lock.burst_step_ns = mean;
+
+		if (gc->lock.burst_n == LOCK_BURST_WIN) {
+			if (!gc->lock.burst && gc->lock.burst_short_n >= LOCK_BURST_ENTER) {
+				gc->lock.burst = true;
+				gc->lock.burst_entries++;
+				info("frame lock: frame-generation bursts (presents %.2f ms apart on average, "
+				     "%" PRIu32 " of the last %d gaps inside a burst): presents paced out evenly, "
+				     "frames chosen by the paced times",
+				     mean / 1000000.0, gc->lock.burst_short_n, LOCK_BURST_WIN);
+			} else if (gc->lock.burst && gc->lock.burst_short_n <= LOCK_BURST_EXIT) {
+				gc->lock.burst = false;
+				info("frame lock: frame-generation bursts ended (presents %.2f ms apart on average)",
+				     mean / 1000000.0);
+			}
+		}
+	}
+	if (time_ns > gc->lock.burst_raw_last_ns)
+		gc->lock.burst_raw_last_ns = time_ns;
+
+	if (gc->lock.burst) {
+		const uint64_t step = (uint64_t)gc->lock.burst_step_ns;
+		const uint64_t cap = time_ns + (uint64_t)(LOCK_BURST_CAP * gc->lock.burst_step_ns);
+
+		if (gc->lock.burst_paced_last_ns && gc->lock.burst_paced_last_ns + step > paced)
+			paced = gc->lock.burst_paced_last_ns + step;
+		if (paced > cap)
+			paced = cap;
+		if (paced != time_ns)
+			gc->lock.burst_moved++;
+	}
+	gc->lock.burst_paced_last_ns = paced;
+	return paced;
 }
 
 /* smoothed present time of slot v on the fitted clock */
@@ -1014,14 +1128,14 @@ static uint64_t lock_select_raw(struct game_capture *gc, uint64_t tick_ns, uint6
 	for (c = newest; c > oldest; c--) {
 		const volatile struct present_record *rec = &shtex->present_log[(c - 1) % PRESENT_LOG_SIZE];
 
-		if (rec->counter == c && rec->time_ns <= target)
+		if (rec->counter == c && lock_paced_time(gc, c, rec->time_ns) <= target)
 			break;
 	}
 	{
 		const volatile struct present_record *rec = &shtex->present_log[(c - 1) % PRESENT_LOG_SIZE];
 
 		if (rec->counter == c)
-			time_ns = rec->time_ns;
+			time_ns = lock_paced_time(gc, c, rec->time_ns);
 	}
 	if (c == newest && time_ns && target - time_ns > (uint64_t)gc->lock.period_ns) {
 		/* the frame due is not presented yet: the game stalled */
@@ -1246,14 +1360,14 @@ static inline uint32_t cadence_gcd(uint32_t a, uint32_t b)
  * within band wins (the shortest cycle: fewest, most evenly placed planned
  * repeats or skips), else the closest one within CADENCE_MAX_E.  false when
  * nothing fits. */
-static bool cadence_choose(double r, double band, uint32_t *out_m, uint32_t *out_n, double *out_e)
+static bool cadence_choose(double r, double band, uint32_t max_n, uint32_t *out_m, uint32_t *out_n, double *out_e)
 {
 	uint32_t best_m = 0, best_n = 0;
 	double best_e = 1.0;
 
 	if (!(r > 0.0))
 		return false;
-	for (uint32_t n = 1; n <= CADENCE_MAX_N; n++) {
+	for (uint32_t n = 1; n <= max_n; n++) {
 		uint32_t m = (uint32_t)lround((double)n * r);
 		double e;
 
@@ -1291,11 +1405,13 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 	const bool skip = false;
 	bool vfr = false;
 
-	if (gc->config.buffering && gc->lock.ready && gc->lock.active && !gc->lock.wander &&
+	if (gc->config.buffering && gc->lock.ready && gc->lock.active && !gc->lock.raw_now &&
 	    obs_get_game_clock_enabled()) {
 		const uint64_t interval = obs_get_frame_interval_ns();
 		const double r = gc->lock.period_ns / (double)interval; /* output ticks per game frame */
 		const uint64_t now = os_gettime_ns();
+		/* Phase 8: a generated stream only takes a whole- or half-frame cadence */
+		const uint32_t max_n = gc->lock.burst ? CADENCE_BURST_MAX_N : CADENCE_MAX_N;
 		uint32_t m = gc->lock.cad_m, n = gc->lock.cad_n;
 		double e = gc->lock.cad_e;
 
@@ -1317,7 +1433,7 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 					uint32_t m2, n2;
 					double e2;
 
-					if (cadence_choose(r, CADENCE_BAND, &m2, &n2, &e2)) {
+					if (cadence_choose(r, CADENCE_BAND, max_n, &m2, &n2, &e2)) {
 						info("game-clock output: cadence %" PRIu32 "/%" PRIu32 " -> %" PRIu32 "/%" PRIu32
 						     " (game %.2f fps, residual %+.2f %%)",
 						     m, n, m2, n2, 1e9 / gc->lock.period_ns, e2 * 100.0);
@@ -1334,7 +1450,7 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 				gc->lock.cad_out_ns = 0;
 			}
 		} else {
-			if (!cadence_choose(r, CADENCE_BAND, &m, &n, &e))
+			if (!cadence_choose(r, CADENCE_BAND, max_n, &m, &n, &e))
 				m = n = 0;
 			gc->lock.cad_out_ns = 0;
 		}
@@ -1397,6 +1513,22 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 	obs_video_set_game_clock_tick(frame_ts, next_tick, skip);
 }
 
+/* Phase 8: in burst mode the fitted clock of the paced stream is followed
+ * (cadence, game-clock output) only when it sits on a whole- or half-frame
+ * cadence; otherwise the frames are chosen by the paced times */
+static bool lock_burst_cadence(const struct game_capture *gc)
+{
+	uint32_t m, n;
+	double e;
+
+	if (!gc->lock.ready || gc->lock.fresh || gc->lock.wander || !obs_get_game_clock_enabled())
+		return false;
+	if (gc->lock.cad_m && gc->lock.cad_n <= CADENCE_BURST_MAX_N)
+		return true;
+	return cadence_choose(gc->lock.period_ns / (double)obs_get_frame_interval_ns(), CADENCE_BAND,
+			      CADENCE_BURST_MAX_N, &m, &n, &e);
+}
+
 static void ring_tick(struct game_capture *gc)
 {
 	volatile struct shtex_data *shtex = gc->shtex_data;
@@ -1425,11 +1557,13 @@ static void ring_tick(struct game_capture *gc)
 	for (uint64_t i = read; i < count; i++) {
 		const uint64_t counter = shtex->present_log[i % PRESENT_LOG_SIZE].counter;
 		const uint64_t time_ns = shtex->present_log[i % PRESENT_LOG_SIZE].time_ns;
-		const uint64_t v = lock_add(gc, counter, time_ns);
+		const uint64_t paced = lock_pace(gc, time_ns); /* Phase 8: bursts paced out */
+		const uint64_t v = lock_add(gc, counter, paced);
 
 		if (counter) {
 			gc->lock.vlog[(counter - 1) % PRESENT_LOG_SIZE].counter = counter;
 			gc->lock.vlog[(counter - 1) % PRESENT_LOG_SIZE].v = v;
+			gc->lock.vlog[(counter - 1) % PRESENT_LOG_SIZE].t = paced;
 		}
 	}
 	if (count != read)
@@ -1446,12 +1580,22 @@ static void ring_tick(struct game_capture *gc)
 		const uint64_t oldest = count > keep ? count - keep : 1;
 		uint64_t c = count;
 
-		if (gc->config.buffering && (gc->lock.ready || gc->lock.wander) && lock_wandering(gc, os_gettime_ns())) {
+		bool raw = false;
+
+		if (gc->config.buffering && (gc->lock.ready || gc->lock.wander))
+			raw = lock_wandering(gc, os_gettime_ns());
+		if (gc->config.buffering && gc->lock.burst && !lock_burst_cadence(gc))
+			raw = true; /* Phase 8: a generated stream, by its paced times */
+		gc->lock.raw_now = raw;
+		if (raw) {
 			/* Phase 7: the game's rate wanders: the frame due by the
 			 * present times alone (through the lock's refits too: the
 			 * choice needs no fit) */
 			c = lock_select_raw(gc, obs_get_video_frame_time(), count, oldest);
-			gc->lock.wander_ticks++;
+			if (gc->lock.wander)
+				gc->lock.wander_ticks++;
+			else
+				gc->lock.burst_ticks++;
 		} else if (gc->config.buffering && gc->lock.ready) {
 			/* Phase 3 choice: the frame the game's timeline puts at this
 			 * tick, delay frames back */
@@ -1536,12 +1680,14 @@ static void flog_close(struct game_capture *gc, const char *reason)
 		info("frame log closed (%s): %s, %" PRIu64 " ticks, %" PRIu64 " lost log entries; frame lock: %" PRIu64
 		     " repeats, %" PRIu64 " skips, %" PRIu64 " starved, %" PRIu64 " lagged, %" PRIu64
 		     " refits, %" PRIu64 " re-anchors, %" PRIu64 " slots the game skipped, %" PRIu64
-		     " ticks on present times (rate wandering)",
+		     " ticks on present times (rate wandering), %" PRIu64 " ticks on paced times (frame-generation "
+		     "bursts, %" PRIu64 " presents paced)",
 		     reason, gc->flog.path, gc->flog.ticks, gc->flog.lost, gc->lock.repeats - gc->flog.repeats0,
 		     gc->lock.skips - gc->flog.skips0, gc->lock.starved - gc->flog.starved0,
 		     gc->lock.lagged - gc->flog.lagged0, gc->lock.resets - gc->flog.resets0,
 		     gc->lock.reanchors - gc->flog.reanchors0, gc->lock.misses - gc->flog.misses0,
-		     gc->lock.wander_ticks - gc->flog.wander_ticks0);
+		     gc->lock.wander_ticks - gc->flog.wander_ticks0, gc->lock.burst_ticks - gc->flog.burst_ticks0,
+		     gc->lock.burst_moved - gc->flog.burst_moved0);
 	}
 
 	if (gc->flog.output) {
@@ -1621,9 +1767,11 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 	gc->flog.reanchors0 = gc->lock.reanchors;
 	gc->flog.misses0 = gc->lock.misses;
 	gc->flog.wander_ticks0 = gc->lock.wander_ticks;
+	gc->flog.burst_ticks0 = gc->lock.burst_ticks;
+	gc->flog.burst_moved0 = gc->lock.burst_moved;
 
 	obs_get_video_info(&ovi);
-	fprintf(gc->flog.file, "# obs-frame-lock log v3\n");
+	fprintf(gc->flog.file, "# obs-frame-lock log v4\n");
 	fprintf(gc->flog.file,
 		"# obs=%s fps=%" PRIu32 "/%" PRIu32 " base=%" PRIu32 "x%" PRIu32 " output=%" PRIu32 "x%" PRIu32
 		" capture=%" PRIu32 "x%" PRIu32 " ring=%" PRIu32 " buffering=%s delay=%" PRIu32
@@ -1753,12 +1901,22 @@ static void flog_tick(struct game_capture *gc)
 			if (v > vp + 1)
 				miss = v - vp - 1;
 		}
-		if (miss)
-			fprintf(gc->flog.file, "present,,,%" PRIu64 ",%" PRIu64 ",,,miss %" PRIu64 ",%" PRIu32 ",,,\n", counter,
-				rec->time_ns, miss, rec->slot);
-		else
-			fprintf(gc->flog.file, "present,,,%" PRIu64 ",%" PRIu64 ",,,,%" PRIu32 ",,,\n", counter,
-				rec->time_ns, rec->slot);
+		{
+			/* Phase 8: a present a burst moved carries its paced time in the smooth_ns column */
+			const uint64_t paced = gc->ring.size ? lock_paced_time(gc, counter, rec->time_ns)
+							     : rec->time_ns;
+			char pacedcol[32];
+
+			pacedcol[0] = 0;
+			if (paced != rec->time_ns)
+				snprintf(pacedcol, sizeof(pacedcol), "%" PRIu64, paced);
+			if (miss)
+				fprintf(gc->flog.file, "present,,,%" PRIu64 ",%" PRIu64 ",,,miss %" PRIu64 ",%" PRIu32 ",,%s,\n",
+					counter, rec->time_ns, miss, rec->slot, pacedcol);
+			else
+				fprintf(gc->flog.file, "present,,,%" PRIu64 ",%" PRIu64 ",,,,%" PRIu32 ",,%s,\n", counter,
+					rec->time_ns, rec->slot, pacedcol);
+		}
 	}
 
 	tick_ns = obs_get_video_frame_time();
@@ -1785,7 +1943,7 @@ static void flog_tick(struct game_capture *gc)
 	if (gc->lock.vfr_now)
 		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%sgc %" PRIu32 "/%" PRIu32, note[0] ? " " : "",
 			 gc->lock.cad_m, gc->lock.cad_n);
-	if (gc->ring.size && gc->lock.wander && gc->lock.active)
+	if (gc->ring.size && gc->lock.raw_now && gc->lock.active)
 		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%sraw", note[0] ? " " : "");
 	if (gc->flog.lost || gc->ring.lost)
 		snprintf(note + strlen(note), sizeof(note) - strlen(note), "%slost=%" PRIu64 "/%" PRIu64,
@@ -2302,6 +2460,12 @@ static inline void reset_frame_interval(struct game_capture *gc)
 		 * performance. */
 		if (!gc->config.limit_framerate)
 			interval /= 2;
+		/* Phase 8: with a frame ring every present is wanted: a game with
+		 * frame generation presents a rendered frame and its generated
+		 * frames within a couple of ms, and this throttle kept only the
+		 * first of them (the ring and the lock sort the rest out) */
+		if (gc->config.frame_ring > 1)
+			interval = 0;
 	}
 
 	gc->global_hook_info->frame_interval = interval;
