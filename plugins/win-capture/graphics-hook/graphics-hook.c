@@ -931,6 +931,25 @@ const char *hook_module_name(const void *addr, char *buf, size_t size)
 	return buf;
 }
 
+/* the same with the full path: a d3d12.dll in front of our hook is one
+ * thing when it is the system's, another when it is a proxy in the game's
+ * folder (ReShade, a mod loader) */
+const char *hook_module_path(const void *addr, char *buf, size_t size)
+{
+	HMODULE mod = NULL;
+	wchar_t path[MAX_PATH];
+
+	if (addr &&
+	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCWSTR)addr, &mod) &&
+	    GetModuleFileNameW(mod, path, MAX_PATH)) {
+		snprintf(buf, size, "%ls", path);
+	} else {
+		snprintf(buf, size, "an unknown module");
+	}
+	return buf;
+}
+
 void hook_in_front_install(struct hook_in_front *h)
 {
 	char m[64];

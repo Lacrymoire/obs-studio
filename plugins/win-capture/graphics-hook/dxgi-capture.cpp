@@ -107,24 +107,40 @@ static bool vt_checked_active = false;
 static void dxgi_log_overlay_modules(void)
 {
 	static const wchar_t *const names[] = {L"RTSSHooks64.dll",          L"RTSSHooks.dll",
-					       L"sl.interposer.dll",        L"nvngx_dlssg.dll",
-					       L"GameOverlayRenderer64.dll", L"GameOverlayRenderer.dll",
-					       L"DiscordHook64.dll",        L"nvspcap64.dll"};
-	char list[320] = "";
+					       L"sl.interposer.dll",        L"sl.dlss_g.dll",
+					       L"nvngx_dlssg.dll",          L"GameOverlayRenderer64.dll",
+					       L"GameOverlayRenderer.dll",  L"DiscordHook64.dll",
+					       L"nvspcap64.dll",            L"ReShade64.dll",
+					       L"dxgi.dll",                 L"d3d12.dll",
+					       L"d3d11.dll"};
+	const size_t first_runtime = 10; /* dxgi.dll, d3d12.dll, d3d11.dll */
+	wchar_t windir[MAX_PATH] = L"";
+	const size_t windir_len = GetWindowsDirectoryW(windir, MAX_PATH);
+	char list[1024] = "";
 
-	for (const wchar_t *name : names) {
-		if (GetModuleHandleW(name)) {
-			char narrow[64];
-			snprintf(narrow, sizeof(narrow), "%s%ls", list[0] ? ", " : "", name);
-			strcat_s(list, narrow);
-		}
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		const HMODULE mod = GetModuleHandleW(names[i]);
+		if (!mod)
+			continue;
+		/* the runtime names are only worth a word when they come from
+		 * outside the Windows folder (a proxy DLL in the game's folder,
+		 * such as ReShade or a mod loader); then with their path */
+		wchar_t path[MAX_PATH];
+		const bool runtime = i >= first_runtime;
+		if (!GetModuleFileNameW(mod, path, MAX_PATH))
+			continue;
+		if (runtime && windir_len && _wcsnicmp(path, windir, windir_len) == 0)
+			continue;
+		char narrow[MAX_PATH + 8];
+		snprintf(narrow, sizeof(narrow), "%s%ls", list[0] ? ", " : "", runtime ? path : names[i]);
+		strcat_s(list, narrow);
 	}
 	hlog("frame-lock: overlay and frame-generation modules in this process: %s", list[0] ? list : "none");
 }
 
 static void vtable_front_check(struct vtable_front *f, IDXGISwapChain *swap)
 {
-	char m[64];
+	char m[MAX_PATH + 1];
 
 	if (f->failed || !f->target || !f->inner)
 		return;
@@ -152,7 +168,7 @@ static void vtable_front_check(struct vtable_front *f, IDXGISwapChain *swap)
 	}
 
 	hlog("frame-lock: %s: the swap chain's method table runs %s before our hook; hooking in front of it there",
-	     f->name, hook_module_name(entry, m, sizeof(m)));
+	     f->name, hook_module_path(entry, m, sizeof(m)));
 
 	DWORD old = 0;
 	if (!VirtualProtect(&table[f->index], sizeof(void *), PAGE_EXECUTE_READWRITE, &old)) {

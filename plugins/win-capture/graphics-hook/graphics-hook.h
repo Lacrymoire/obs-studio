@@ -348,6 +348,7 @@ extern __declspec(thread) int captured_in_front;
 
 extern const void *hook_follow_jumps(const void *fn);
 extern const char *hook_module_name(const void *addr, char *buf, size_t size);
+extern const char *hook_module_path(const void *addr, char *buf, size_t size);
 extern void hook_in_front_install(struct hook_in_front *h);
 
 static inline bool should_passthrough()
