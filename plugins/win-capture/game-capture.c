@@ -149,7 +149,11 @@ struct game_capture_config {
  * at least LOCK_MISS_TOL_MIN_NS: a dropped frame's Present returns up to a
  * couple of ms early) skipped vblanks; the game's clock did not move.  Only
  * trusted while the ordinary presents sit on the line within that tolerance
- * (lock_note_err) and the gap is under LOCK_MISS_MAX_NS. */
+ * (lock_note_err) and the gap is under LOCK_MISS_MAX_NS, and only while the
+ * tolerance is under half the period: a faster clock (a menu at 1000 fps)
+ * has no grid that can be read, every late present would land on it, and a
+ * game dropping back to 130 fps would be kept on the menu's clock for good
+ * (lock_grid_readable). */
 #define LOCK_MISS_TOL 0.25
 #define LOCK_MISS_TOL_MIN_NS 2000000.0
 #define LOCK_MISS_MAX_NS 1000000000ULL
@@ -182,8 +186,10 @@ struct game_capture_config {
  * further one lands one mean present interval after the one before (the mean
  * of the last LOCK_BURST_WIN gaps: the render interval over the burst size).
  * Burst mode begins when LOCK_BURST_ENTER of those gaps are shorter than
- * LOCK_BURST_GAP x the mean (and than LOCK_BURST_GAP_MAX_NS) and ends when
- * LOCK_BURST_EXIT or fewer are; a normal game's catch-up doubles never reach it.  In burst mode the frames
+ * LOCK_BURST_GAP x the mean (and than LOCK_BURST_GAP_MAX_NS), in at least two
+ * runs with a long gap between them (a run of short gaps at the tail alone is
+ * a game speeding up: the menu after gameplay), and ends when LOCK_BURST_EXIT
+ * or fewer are; a normal game's catch-up doubles never reach it.  In burst mode the frames
  * are chosen by the paced times (lock_select_raw) unless the paced rate sits
  * on a whole- or half-frame cadence (a capped game: 2x of 60, 6x of 20). */
 #define LOCK_BURST_WIN 24
@@ -629,6 +635,14 @@ static inline double lock_miss_tol(const struct game_capture *gc)
 	return tol < LOCK_MISS_TOL_MIN_NS ? LOCK_MISS_TOL_MIN_NS : tol;
 }
 
+/* whether a present a whole number of periods late can be told from one off
+ * the grid at all: not when the tolerance reaches half the period (a clock
+ * above 250 fps with the 2 ms floor) */
+static inline bool lock_grid_readable(const struct game_capture *gc)
+{
+	return lock_miss_tol(gc) < 0.5 * gc->lock.period_ns;
+}
+
 /* where the ordinary presents sit against the line: a running mean of the
  * signed error (bias: the game's grid moved against the line, as the Present
  * call's place within the vblank period does after a hitch) and of the spread
@@ -679,6 +693,24 @@ static inline uint64_t lock_paced_time(const struct game_capture *gc, uint64_t c
 	return time_ns;
 }
 
+/* runs of short gaps in the burst window, oldest first (bursts are short gaps
+ * separated by long ones; one run is a game that just sped up) */
+static uint32_t lock_burst_runs(const struct game_capture *gc)
+{
+	const uint32_t first = gc->lock.burst_n == LOCK_BURST_WIN ? gc->lock.burst_head : 0;
+	uint32_t runs = 0, j;
+	bool prev = false;
+
+	for (j = 0; j < gc->lock.burst_n; j++) {
+		const bool sh = gc->lock.burst_short[(first + j) % LOCK_BURST_WIN];
+
+		if (sh && !prev)
+			runs++;
+		prev = sh;
+	}
+	return runs;
+}
+
 /* Phase 8 frame-generation bursts: see LOCK_BURST_*.  Returns the paced time
  * of the present; the window and the mode are kept over refits (they describe
  * the stream, not the fit) and cleared by lock_reopen (a new hook). */
@@ -711,7 +743,8 @@ static uint64_t lock_pace(struct game_capture *gc, uint64_t time_ns)
 		gc->lock.burst_step_ns = mean;
 
 		if (gc->lock.burst_n == LOCK_BURST_WIN) {
-			if (!gc->lock.burst && gc->lock.burst_short_n >= LOCK_BURST_ENTER) {
+			if (!gc->lock.burst && gc->lock.burst_short_n >= LOCK_BURST_ENTER &&
+			    lock_burst_runs(gc) >= 2) {
 				gc->lock.burst = true;
 				gc->lock.burst_entries++;
 				info("frame lock: frame-generation bursts (presents %.2f ms apart on average, "
@@ -925,7 +958,7 @@ static uint64_t lock_add(struct game_capture *gc, uint64_t counter, uint64_t tim
 			const double tol = lock_miss_tol(gc);
 			const double eg = err - gc->lock.bias_ns;
 
-			if (gc->lock.jitter_ns <= tol) {
+			if (gc->lock.jitter_ns <= tol && lock_grid_readable(gc)) {
 				const double k = (double)llround(eg / gc->lock.period_ns);
 
 				if (k >= 1.0 && fabs(eg - k * gc->lock.period_ns) <= tol) {
