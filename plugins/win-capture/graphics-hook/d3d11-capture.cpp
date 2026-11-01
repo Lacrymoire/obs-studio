@@ -1,5 +1,5 @@
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_4.h>
 
 #include "dxgi-helpers.hpp"
 #include "graphics-hook.h"
@@ -199,6 +199,34 @@ static bool d3d11_shmem_init(HWND window)
 	return true;
 }
 
+/* Frame-locked capture: this process' video memory as Windows accounts it
+ * (see d3d12_log_video_memory) */
+static void d3d11_log_video_memory(const char *when)
+{
+	IDXGIDevice *dxgi_device = nullptr;
+	IDXGIAdapter *adapter = nullptr;
+	IDXGIAdapter3 *adapter3 = nullptr;
+	DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, shared = {};
+
+	if (!data.device || FAILED(data.device->QueryInterface(IID_PPV_ARGS(&dxgi_device))))
+		return;
+	HRESULT hr = dxgi_device->GetAdapter(&adapter);
+	dxgi_device->Release();
+	if (FAILED(hr))
+		return;
+	hr = adapter->QueryInterface(IID_PPV_ARGS(&adapter3));
+	adapter->Release();
+	if (FAILED(hr))
+		return;
+	if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+	    SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+		hlog("video memory (%s): the game has %llu MB resident of a %llu MB budget on the GPU, %llu MB of "
+		     "%llu MB in system memory",
+		     when, (unsigned long long)(local.CurrentUsage >> 20), (unsigned long long)(local.Budget >> 20),
+		     (unsigned long long)(shared.CurrentUsage >> 20), (unsigned long long)(shared.Budget >> 20));
+	adapter3->Release();
+}
+
 static bool d3d11_shtex_init(HWND window)
 {
 	uintptr_t handles[FRAME_RING_MAX];
@@ -220,6 +248,7 @@ static bool d3d11_shtex_init(HWND window)
 	}
 
 	hlog("d3d11 shared texture capture successful (%u slot%s)", data.ring_size, data.ring_size == 1 ? "" : "s");
+	d3d11_log_video_memory("ring created");
 	return true;
 }
 
@@ -245,7 +274,9 @@ static void d3d11_init(IDXGISwapChain *swap)
 
 	const bool success = global_hook_info->force_shmem ? d3d11_shmem_init(window) : d3d11_shtex_init(window);
 	if (!success) {
+		d3d11_log_video_memory("capture init failed");
 		d3d11_free();
+		capture_init_failed();
 	}
 }
 

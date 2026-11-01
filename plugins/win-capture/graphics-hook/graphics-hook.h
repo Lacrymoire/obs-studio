@@ -36,6 +36,7 @@ static inline const char *get_process_name(void);
 static inline HMODULE get_system_module(const char *module);
 static inline HMODULE load_system_library(const char *module);
 extern uint64_t os_gettime_ns(void);
+extern uint64_t capture_init_retry_ns;
 
 #define flog(format, ...) hlog("%s: " format, __FUNCTION__, ##__VA_ARGS__)
 #define flog_hr(text, hr) hlog_hr(__FUNCTION__ ": " text, hr)
@@ -275,6 +276,9 @@ static inline bool capture_should_init(void)
 	bool should_init = false;
 
 	if (!capture_active()) {
+		/* frame-locked capture: a failed init waits (capture_init_failed) */
+		if (capture_init_retry_ns && os_gettime_ns() < capture_init_retry_ns)
+			return false;
 		if (capture_restarted()) {
 			if (capture_alive()) {
 				if (!ipc_pipe_client_valid(&pipe)) {
@@ -300,6 +304,17 @@ static inline bool capture_should_init(void)
 static inline bool capture_ring_resize_wanted(const struct shtex_data *shtex)
 {
 	return shtex && capture_active() && shtex->ring_size != capture_ring_size_wanted();
+}
+
+/* Frame-locked capture: after a failed capture init (video memory ran out for
+ * the ring while the game rebuilt its swap chain on an alt-tab) wait half a
+ * second before the next attempt instead of trying again at every present;
+ * each attempt creates and destroys a device and the slots made so far. */
+#define CAPTURE_INIT_RETRY_NS 500000000ULL
+static inline void capture_init_failed(void)
+{
+	capture_init_retry_ns = os_gettime_ns() + CAPTURE_INIT_RETRY_NS;
+	hlog("capture init failed; trying again in 0.5 s");
 }
 
 #if COMPILE_VULKAN_HOOK

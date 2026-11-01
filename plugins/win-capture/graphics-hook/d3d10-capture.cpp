@@ -289,6 +289,7 @@ static void d3d10_init(IDXGISwapChain *swap)
 	const bool success = global_hook_info->force_shmem ? d3d10_shmem_init(window) : d3d10_shtex_init(window);
 	if (!success) {
 		d3d10_free();
+		capture_init_failed();
 	}
 }
 

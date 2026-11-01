@@ -187,6 +187,36 @@ static bool d3d12_init_11on12(ID3D12Device *device)
 	return true;
 }
 
+/* Frame-locked capture: this process' video memory as Windows accounts it
+ * (resident bytes and the budget the GPU scheduler grants the process; see
+ * log_video_memory in game-capture.c for the OBS side), logged when the ring
+ * is created and when that fails, so the log tells a leak from a tight
+ * budget */
+static void d3d12_log_video_memory(ID3D12Device *device, const char *when)
+{
+	typedef HRESULT(WINAPI * create_factory1_t)(REFIID, void **);
+	HMODULE dxgi = get_system_module("dxgi.dll");
+	create_factory1_t create_factory1 =
+		dxgi ? (create_factory1_t)GetProcAddress(dxgi, "CreateDXGIFactory1") : nullptr;
+	IDXGIFactory4 *factory = nullptr;
+	IDXGIAdapter3 *adapter = nullptr;
+	DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, shared = {};
+
+	if (!device || !create_factory1 || FAILED(create_factory1(IID_PPV_ARGS(&factory))))
+		return;
+	const HRESULT hr = factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter));
+	factory->Release();
+	if (FAILED(hr))
+		return;
+	if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+	    SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+		hlog("video memory (%s): the game has %llu MB resident of a %llu MB budget on the GPU, %llu MB of "
+		     "%llu MB in system memory",
+		     when, (unsigned long long)(local.CurrentUsage >> 20), (unsigned long long)(local.Budget >> 20),
+		     (unsigned long long)(shared.CurrentUsage >> 20), (unsigned long long)(shared.Budget >> 20));
+	adapter->Release();
+}
+
 static bool d3d12_shtex_init(ID3D12Device *device, HWND window, UINT count)
 {
 	uintptr_t handles[FRAME_RING_MAX];
@@ -208,6 +238,7 @@ static bool d3d12_shtex_init(ID3D12Device *device, HWND window, UINT count)
 	}
 
 	hlog("d3d12 shared texture capture successful (%u slot%s)", data.ring_size, data.ring_size == 1 ? "" : "s");
+	d3d12_log_video_memory(device, "ring created");
 	return true;
 }
 
@@ -270,7 +301,9 @@ static void d3d12_init(IDXGISwapChain *swap)
 			}
 
 			if (!d3d12_shtex_init(device, window, count)) {
+				d3d12_log_video_memory(device, "capture init failed");
 				d3d12_free();
+				capture_init_failed();
 			}
 		}
 

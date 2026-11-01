@@ -60,6 +60,7 @@ static HANDLE shmem_file_handle = 0;
 static struct thread_data thread_data = {0};
 
 volatile bool active = false;
+uint64_t capture_init_retry_ns = 0; /* frame-locked capture: see capture_init_failed */
 struct hook_info *global_hook_info = NULL;
 
 static inline void wait_for_dll_main_finish(HANDLE thread_handle)

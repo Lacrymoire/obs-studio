@@ -7,7 +7,7 @@
 #include <util/threading.h>
 #include <util/windows/window-helpers.h>
 #include <windows.h>
-#include <dxgi.h>
+#include <dxgi1_4.h>
 #include <util/sse-intrin.h>
 #include <util/util_uint64.h>
 #include <ipc-util/pipe.h>
@@ -296,6 +296,7 @@ struct game_capture {
 	uint32_t ring_wanted;
 	uint64_t ring_need_ns;
 	uint64_t ring_grow_ns;
+	uint64_t vram_log_ns; /* last video-memory log line */
 
 	/* frame-locked capture: Phase 2 frame ring (see ring_tick).  size is 0
 	 * when the hook gave us a single texture (stock behaviour). */
@@ -1331,8 +1332,54 @@ static uint64_t lock_select(struct game_capture *gc, uint64_t tick_ns, uint64_t 
  * Phase 2 still shows the newest copied frame, exactly like the single shared
  * texture did; Phase 3 replaces that choice with timestamp smoothing. */
 
+/* Frame-locked capture: this process' video memory as Windows accounts it.
+ * The budget is what the GPU scheduler lets the process keep resident; it is
+ * cut for a background process (OBS behind a fullscreen game) when the
+ * foreground one wants the memory.  Logged when the ring opens and closes,
+ * when a recording starts, and every 30 s with the debug log on, so a leak or
+ * a tight budget shows in the log next to the ring events.  Needs a graphics
+ * context (obs_enter_graphics). */
+#define VRAM_LOG_PERIOD_NS 30000000000ULL
+static const GUID gc_iid_dxgi_device = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
+static const GUID gc_iid_dxgi_adapter3 = {0x645967a4, 0x1392, 0x4310, {0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd}};
+
+static void log_video_memory(struct game_capture *gc, const char *when)
+{
+	IUnknown *device = gs_get_device_obj();
+	IDXGIDevice *dxgi_device = NULL;
+	IDXGIAdapter *adapter = NULL;
+	IDXGIAdapter3 *adapter3 = NULL;
+	DXGI_QUERY_VIDEO_MEMORY_INFO local = {0}, shared = {0};
+	HRESULT hr;
+
+	gc->vram_log_ns = os_gettime_ns();
+	if (!device || gs_get_device_type() != GS_DEVICE_DIRECT3D_11)
+		return;
+	hr = device->lpVtbl->QueryInterface(device, &gc_iid_dxgi_device, (void **)&dxgi_device);
+	if (FAILED(hr))
+		return;
+	hr = dxgi_device->lpVtbl->GetAdapter(dxgi_device, &adapter);
+	dxgi_device->lpVtbl->Release(dxgi_device);
+	if (FAILED(hr))
+		return;
+	hr = adapter->lpVtbl->QueryInterface(adapter, &gc_iid_dxgi_adapter3, (void **)&adapter3);
+	adapter->lpVtbl->Release(adapter);
+	if (FAILED(hr))
+		return;
+	if (SUCCEEDED(adapter3->lpVtbl->QueryVideoMemoryInfo(adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+	    SUCCEEDED(adapter3->lpVtbl->QueryVideoMemoryInfo(adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+							  &shared)))
+		info("video memory (%s): OBS has %.0f MB resident of a %.0f MB budget on the GPU, %.0f MB of %.0f MB "
+		     "in system memory",
+		     when, (double)local.CurrentUsage / 1048576.0, (double)local.Budget / 1048576.0,
+		     (double)shared.CurrentUsage / 1048576.0, (double)shared.Budget / 1048576.0);
+	adapter3->lpVtbl->Release(adapter3);
+}
+
 static void ring_free(struct game_capture *gc)
 {
+	if (gc->ring.size)
+		log_video_memory(gc, "ring closing");
 	/* slot 0 is the texture init_shtex_capture opened; every slot may be
 	 * aliased by gc->texture, so drop that alias here and let the caller's
 	 * gs_texture_destroy(gc->texture) see NULL */
@@ -1380,6 +1427,7 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 	     " frame%s",
 	     n, gc->cx, gc->cy, gc->config.frame_ring, gc->config.buffering ? "on" : "off", gc->config.buffer_delay,
 	     gc->config.buffer_delay == 1 ? "" : "s");
+	log_video_memory(gc, "ring opened");
 	return true;
 }
 
@@ -1393,7 +1441,8 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
  * burst at once (Phase 8: about 4 x the factor, 24 for 6x).  The need has to
  * hold for RING_GROW_SUSTAIN_NS (a loading screen running fast for a moment
  * does not count), the rate term stops at RING_GROW_MAX_RATE x the output rate
- * (faster is a menu clock, where lock_delay shortens the delay instead), the
+ * except for frame-generation bursts (faster is a menu clock, where lock_delay
+ * shortens the delay instead), the
  * "Frame ring limit" setting caps it, and the ring never shrinks within a
  * hook.  Growing writes the new size to hook_info; the hook frees and
  * re-creates its capture at its next present (capture_ring_resize_wanted), the
@@ -1426,23 +1475,25 @@ static void ring_grow_check(struct game_capture *gc)
 	if (gc->ring_grow_ns && now - gc->ring_grow_ns < RING_GROW_MIN_NS)
 		return; /* the last request is still being carried out */
 
-	if (gc->lock.period_ns * RING_GROW_MAX_RATE >= interval * 0.95) {
+	if (gc->lock.burst || gc->lock.period_ns * RING_GROW_MAX_RATE >= interval * 0.95) {
 		/* frames the delay spans at this rate, the newest frame, the slot
-		 * the hook writes next and one of margin (lock_delay) */
+		 * the hook writes next and one of margin (lock_delay).  In burst
+		 * mode the period is the paced one (Phase 8: the generated frames
+		 * spread evenly over the render interval) and every one of those
+		 * presents takes a slot, so the rate counts however high it is:
+		 * 6x frame generation at 84 fps = 504 presents/s = 17 + 3 slots */
 		const double delay_ns = (double)gc->config.buffer_delay * interval;
 		needed = (uint32_t)ceil(delay_ns / gc->lock.period_ns) + 3;
-		why = "present rate";
+		why = gc->lock.burst ? "frame-generation bursts" : "present rate";
 	}
 	if (gc->lock.burst) {
-		/* a burst is one rendered frame and its generated ones: presents
-		 * per burst = gaps in the window over runs of short gaps */
+		/* and never below 4 x the factor (Phase 8's rule): presents per
+		 * burst = gaps in the window over runs of short gaps */
 		const uint32_t runs = lock_burst_runs(gc);
 		const uint32_t factor = runs ? (LOCK_BURST_WIN + runs / 2) / runs : 1;
 
-		if (4 * factor > needed) {
+		if (4 * factor > needed)
 			needed = 4 * factor;
-			why = "frame-generation bursts";
-		}
 	}
 	if (needed > cap)
 		needed = cap;
@@ -1953,6 +2004,9 @@ static void flog_open(struct game_capture *gc, obs_weak_output_t *weak, obs_outp
 		obs_get_video_frame_time(), os_gettime_ns(), count, latest, obs_output_get_total_frames(output));
 
 	info("frame log opened: %s", path.array);
+	obs_enter_graphics();
+	log_video_memory(gc, "recording started");
+	obs_leave_graphics();
 	dstr_free(&rec);
 }
 
@@ -3702,6 +3756,13 @@ static void game_capture_tick(void *data, float seconds)
 			}
 
 			ring_tick(gc);
+			/* frame-locked capture: the video-memory trend, with the debug log on */
+			if (gc->config.frame_log && gc->ring.size &&
+			    os_gettime_ns() - gc->vram_log_ns >= VRAM_LOG_PERIOD_NS) {
+				obs_enter_graphics();
+				log_video_memory(gc, "every 30 s");
+				obs_leave_graphics();
+			}
 
 			if (gc->config.cursor) {
 				DPI_AWARENESS_CONTEXT previous = NULL;
