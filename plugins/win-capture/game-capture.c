@@ -169,7 +169,11 @@ struct game_capture_config {
  * spread by LOCK_WANDER_SPREAD across them, switch the choice to the present
  * times themselves with no cadence (lock_select_raw); LOCK_WANDER_CALM_NS
  * without a shift switches back.  A period step of LOCK_WANDER_STEP on a
- * mature fit (menu to game) forgets the shifts before it. */
+ * mature fit (menu to game) forgets the shifts before it.  A cadence change
+ * that reverses the one before it (the rate turned back) counts as a shift
+ * too (game_clock_tick): a fit that keeps up with a wandering rate hops the
+ * cadence instead of shifting the anchor; a run of changes in one direction
+ * is a rate settling (a loading screen climbing to vsync) and does not. */
 #define LOCK_WANDER_N 3
 #define LOCK_WANDER_MAX 8
 #define LOCK_WANDER_WINDOW_NS 15000000000ULL
@@ -187,9 +191,11 @@ struct game_capture_config {
  * of the last LOCK_BURST_WIN gaps: the render interval over the burst size).
  * Burst mode begins when LOCK_BURST_ENTER of those gaps are shorter than
  * LOCK_BURST_GAP x the mean (and than LOCK_BURST_GAP_MAX_NS), in at least two
- * runs with a long gap between them (a run of short gaps at the tail alone is
- * a game speeding up: the menu after gameplay), and ends when LOCK_BURST_EXIT
- * or fewer are; a normal game's catch-up doubles never reach it.  In burst mode the frames
+ * runs with a long gap between them, with at most LOCK_BURST_MID_MAX gaps
+ * between LOCK_BURST_GAP and LOCK_BURST_LONG x the mean (a game speeding up
+ * into a menu, or a stall inflating the mean, fills that middle; bursts
+ * leave it empty), and ends when LOCK_BURST_EXIT or fewer are short; a
+ * normal game's catch-up doubles never reach it.  In burst mode the frames
  * are chosen by the paced times (lock_select_raw) unless the paced rate sits
  * on a whole- or half-frame cadence (a capped game: 2x of 60, 6x of 20). */
 #define LOCK_BURST_WIN 24
@@ -198,6 +204,8 @@ struct game_capture_config {
 #define LOCK_BURST_ENTER 9  /* of LOCK_BURST_WIN (2x generation: half the gaps) */
 #define LOCK_BURST_EXIT 2   /* of LOCK_BURST_WIN */
 #define LOCK_BURST_CAP 4.0  /* a paced time at most this many mean intervals after the present */
+#define LOCK_BURST_LONG 1.5 /* a burst stream is bimodal: gaps under LOCK_BURST_GAP or over LOCK_BURST_LONG x the mean */
+#define LOCK_BURST_MID_MAX 3 /* gaps between the two allowed in the window (jitter), more is a game speeding up */
 #define CADENCE_BURST_MAX_N 2
 /* Phase 6 cadence (see cadence_choose): m output ticks per n game frames */
 #define CADENCE_BAND 0.02      /* residual (paced tick rate / output rate - 1) a cadence may have to be chosen */
@@ -336,6 +344,7 @@ struct game_capture {
 		double cad_e;            /* its residual: paced tick rate / output rate - 1 */
 		uint64_t cad_out_ns;     /* since when the game's rate has been outside CADENCE_KEEP (0 = within) */
 		uint64_t cad_changes;
+		int cad_dir;             /* direction of the last cadence change (+1 more ticks per frame, -1 fewer, 0 none) */
 		uint64_t delay_ns;       /* buffer delay used this tick: the setting, or less when the ring is short */
 		/* Phase 6 grid slots (lock_add): the clock runs over slots, not
 		 * presents; a game on a vblank grid that misses a vblank has left a
@@ -693,6 +702,21 @@ static inline uint64_t lock_paced_time(const struct game_capture *gc, uint64_t c
 	return time_ns;
 }
 
+/* gaps in the burst window that are neither short nor long against the mean
+ * (a burst stream has none but jitter; a speed-up or a stall has many) */
+static uint32_t lock_burst_mid(const struct game_capture *gc, double mean)
+{
+	uint32_t mid = 0, j;
+
+	for (j = 0; j < gc->lock.burst_n; j++) {
+		const double gap = (double)gc->lock.burst_gaps[j];
+
+		if (gap >= LOCK_BURST_GAP * mean && gap < LOCK_BURST_LONG * mean)
+			mid++;
+	}
+	return mid;
+}
+
 /* runs of short gaps in the burst window, oldest first (bursts are short gaps
  * separated by long ones; one run is a game that just sped up) */
 static uint32_t lock_burst_runs(const struct game_capture *gc)
@@ -744,7 +768,7 @@ static uint64_t lock_pace(struct game_capture *gc, uint64_t time_ns)
 
 		if (gc->lock.burst_n == LOCK_BURST_WIN) {
 			if (!gc->lock.burst && gc->lock.burst_short_n >= LOCK_BURST_ENTER &&
-			    lock_burst_runs(gc) >= 2) {
+			    lock_burst_runs(gc) >= 2 && lock_burst_mid(gc, mean) <= LOCK_BURST_MID_MAX) {
 				gc->lock.burst = true;
 				gc->lock.burst_entries++;
 				info("frame lock: frame-generation bursts (presents %.2f ms apart on average, "
@@ -1467,9 +1491,14 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 					double e2;
 
 					if (cadence_choose(r, CADENCE_BAND, max_n, &m2, &n2, &e2)) {
+						const int dir = (double)m2 / (double)n2 > (double)m / (double)n ? 1 : -1;
+
 						info("game-clock output: cadence %" PRIu32 "/%" PRIu32 " -> %" PRIu32 "/%" PRIu32
 						     " (game %.2f fps, residual %+.2f %%)",
 						     m, n, m2, n2, 1e9 / gc->lock.period_ns, e2 * 100.0);
+						if (gc->lock.cad_dir && dir != gc->lock.cad_dir)
+							lock_wander_event(gc, now);
+						gc->lock.cad_dir = dir;
 						m = m2;
 						n = n2;
 						e = e2;
