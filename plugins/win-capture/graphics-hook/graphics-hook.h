@@ -293,6 +293,15 @@ static inline bool capture_should_init(void)
 	return should_init;
 }
 
+/* Frame-locked capture, automatic ring size: OBS asks for a different ring by
+ * writing hook_info.frame_ring_size while the capture runs.  The capture path
+ * then frees its capture (capture_free signals the restart) and re-creates it
+ * at the new size at the same present, the path a swap chain rebuild takes. */
+static inline bool capture_ring_resize_wanted(const struct shtex_data *shtex)
+{
+	return shtex && capture_active() && shtex->ring_size != capture_ring_size_wanted();
+}
+
 #if COMPILE_VULKAN_HOOK
 extern __declspec(thread) int vk_presenting;
 #endif

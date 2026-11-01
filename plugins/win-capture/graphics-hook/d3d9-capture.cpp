@@ -561,7 +561,7 @@ static inline void d3d9_shmem_capture(IDirect3DSurface9 *backbuffer)
 
 static void d3d9_capture(IDirect3DDevice9 *device, IDirect3DSurface9 *backbuffer)
 {
-	if (capture_should_stop()) {
+	if (capture_should_stop() || capture_ring_resize_wanted(data.shtex_info)) {
 		d3d9_free();
 	}
 	if (capture_should_init()) {

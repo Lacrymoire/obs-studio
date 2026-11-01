@@ -1201,7 +1201,7 @@ static void vk_capture(struct vk_data *data, VkQueue queue, const VkPresentInfoK
 		return;
 	}
 
-	if (capture_should_stop()) {
+	if (capture_should_stop() || capture_ring_resize_wanted(data->cur_swap ? data->cur_swap->shtex_info : NULL)) {
 		vk_shtex_free(data);
 	}
 	if (capture_should_init()) {

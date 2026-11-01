@@ -290,6 +290,13 @@ struct game_capture {
 
 	void (*copy_texture)(struct game_capture *);
 
+	/* frame-locked capture, automatic ring size (ring_grow_check): the slots
+	 * asked of the hook for this capture (hook_info.frame_ring_size), since
+	 * when the current ring has been too small, and when it was last grown */
+	uint32_t ring_wanted;
+	uint64_t ring_need_ns;
+	uint64_t ring_grow_ns;
+
 	/* frame-locked capture: Phase 2 frame ring (see ring_tick).  size is 0
 	 * when the hook gave us a single texture (stock behaviour). */
 	struct {
@@ -1155,7 +1162,7 @@ static uint64_t lock_delay(struct game_capture *gc)
 			if (!gc->lock.ring_short_logged) {
 				gc->lock.ring_short_logged = true;
 				info("frame lock: the ring of %" PRIu32 " cannot hold the buffer delay at %.1f fps; video "
-				     "delay %.1f ms instead of %.1f ms for this game (a larger ring setting fixes it)",
+				     "delay %.1f ms instead of %.1f ms for this game (the ring grows if the rate holds; else raise the ring limit)",
 				     gc->ring.size, 1e9 / gc->lock.period_ns, fit / 1000000.0,
 				     (double)gc->config.buffer_delay * obs_get_frame_interval_ns() / 1000000.0);
 			}
@@ -1369,10 +1376,94 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 	gc->ring.shown_slot = 0;
 	gc->shtex_data->read_slot = 0;
 	lock_reopen(gc);
-	info("frame ring: %u slots of %" PRIu32 "x%" PRIu32 "; buffering %s, delay %" PRIu32 " frame%s", n, gc->cx,
-	     gc->cy, gc->config.buffering ? "on" : "off", gc->config.buffer_delay,
+	info("frame ring: %u slots of %" PRIu32 "x%" PRIu32 " (limit %" PRIu32 "); buffering %s, delay %" PRIu32
+	     " frame%s",
+	     n, gc->cx, gc->cy, gc->config.frame_ring, gc->config.buffering ? "on" : "off", gc->config.buffer_delay,
 	     gc->config.buffer_delay == 1 ? "" : "s");
 	return true;
+}
+
+/* Frame-locked capture, automatic ring size.
+ *
+ * Every slot is a full frame of video memory (33 MB at 4K BGRA, twice that for
+ * a 16-bit float HDR game), so the ring starts at buffer delay + 3 slots, the
+ * least lock_delay needs for a game at or below the output rate, and grows
+ * only when this game needs more: a present rate above the output rate makes
+ * the delay span more frames, and a frame-generation stream presents a whole
+ * burst at once (Phase 8: about 4 x the factor, 24 for 6x).  The need has to
+ * hold for RING_GROW_SUSTAIN_NS (a loading screen running fast for a moment
+ * does not count), the rate term stops at RING_GROW_MAX_RATE x the output rate
+ * (faster is a menu clock, where lock_delay shortens the delay instead), the
+ * "Frame ring limit" setting caps it, and the ring never shrinks within a
+ * hook.  Growing writes the new size to hook_info; the hook frees and
+ * re-creates its capture at its next present (capture_ring_resize_wanted), the
+ * path a swap chain rebuild takes, so the capture restarts once ("hooked"
+ * again) and the lock carries its period over (lock_reopen). */
+#define RING_GROW_SUSTAIN_NS 2000000000ULL
+#define RING_GROW_MIN_NS 5000000000ULL
+#define RING_GROW_MAX_RATE 4.0
+
+static inline uint32_t ring_start_size(const struct game_capture *gc)
+{
+	const uint32_t least = gc->config.buffer_delay + 3;
+
+	if (!gc->config.buffering)
+		return 1;
+	return least < gc->config.frame_ring ? least : gc->config.frame_ring;
+}
+
+static void ring_grow_check(struct game_capture *gc)
+{
+	const uint32_t cap = gc->config.frame_ring;
+	const uint64_t now = os_gettime_ns();
+	const double interval = (double)obs_get_frame_interval_ns();
+	uint32_t needed = 0;
+	const char *why = "";
+
+	if (!gc->config.buffering || !gc->global_hook_info || gc->ring.size >= cap || !gc->lock.ready ||
+	    gc->lock.fresh)
+		return;
+	if (gc->ring_grow_ns && now - gc->ring_grow_ns < RING_GROW_MIN_NS)
+		return; /* the last request is still being carried out */
+
+	if (gc->lock.period_ns * RING_GROW_MAX_RATE >= interval * 0.95) {
+		/* frames the delay spans at this rate, the newest frame, the slot
+		 * the hook writes next and one of margin (lock_delay) */
+		const double delay_ns = (double)gc->config.buffer_delay * interval;
+		needed = (uint32_t)ceil(delay_ns / gc->lock.period_ns) + 3;
+		why = "present rate";
+	}
+	if (gc->lock.burst) {
+		/* a burst is one rendered frame and its generated ones: presents
+		 * per burst = gaps in the window over runs of short gaps */
+		const uint32_t runs = lock_burst_runs(gc);
+		const uint32_t factor = runs ? (LOCK_BURST_WIN + runs / 2) / runs : 1;
+
+		if (4 * factor > needed) {
+			needed = 4 * factor;
+			why = "frame-generation bursts";
+		}
+	}
+	if (needed > cap)
+		needed = cap;
+	if (needed <= gc->ring.size) {
+		gc->ring_need_ns = 0;
+		return;
+	}
+	if (!gc->ring_need_ns) {
+		gc->ring_need_ns = now;
+		return;
+	}
+	if (now - gc->ring_need_ns < RING_GROW_SUSTAIN_NS)
+		return;
+
+	gc->ring_need_ns = 0;
+	gc->ring_grow_ns = now;
+	gc->ring_wanted = needed;
+	gc->global_hook_info->frame_ring_size = needed;
+	info("frame ring: %" PRIu32 " slots are too few for this game (%s, %.1f presents/s); growing to %" PRIu32
+	     " (limit %" PRIu32 "), the capture restarts once",
+	     gc->ring.size, why, 1e9 / gc->lock.period_ns, needed, cap);
 }
 
 /* Frame-locked capture, Phase 5/6: game-clock output with a cadence.
@@ -1635,6 +1726,7 @@ static void ring_tick(struct game_capture *gc)
 	if (count != read)
 		lock_fit(gc);
 	gc->ring.read = count;
+	ring_grow_check(gc);
 
 	if (count == 0)
 		return;
@@ -2304,7 +2396,7 @@ static void game_capture_update(void *data, obs_data_t *settings)
 								       (double)obs_get_frame_interval_ns() / 1000000.0
 							     : 0.0;
 		info("frame-lock buffering: %s, delay %" PRIu32 " frame%s (video delay %.1f ms; matching audio sync offset "
-		     "+%.0f ms), ring %" PRIu32 ", debug log: %s",
+		     "+%.0f ms), ring limit %" PRIu32 ", debug log: %s",
 		     gc->config.buffering ? "on" : "off", gc->config.buffer_delay, gc->config.buffer_delay == 1 ? "" : "s",
 		     delay_ms, delay_ms, gc->config.frame_ring, gc->config.frame_log ? "on" : "off");
 	}
@@ -2530,7 +2622,7 @@ static inline void reset_frame_interval(struct game_capture *gc)
 		 * frame generation presents a rendered frame and its generated
 		 * frames within a couple of ms, and this throttle kept only the
 		 * first of them (the ring and the lock sort the rest out) */
-		if (gc->config.frame_ring > 1)
+		if (gc->ring_wanted > 1)
 			interval = 0;
 	}
 
@@ -2562,7 +2654,11 @@ static inline bool init_hook_info(struct game_capture *gc)
 	gc->global_hook_info->force_shmem = gc->config.force_shmem;
 	gc->global_hook_info->UNUSED_use_scale = false;
 	gc->global_hook_info->allow_srgb_alias = true;
-	gc->global_hook_info->frame_ring_size = gc->config.frame_ring;
+	/* automatic ring size: start small, ring_grow_check raises it */
+	gc->ring_wanted = ring_start_size(gc);
+	gc->ring_need_ns = 0;
+	gc->ring_grow_ns = 0;
+	gc->global_hook_info->frame_ring_size = gc->ring_wanted;
 	reset_frame_interval(gc);
 
 	obs_enter_graphics();
@@ -3905,7 +4001,7 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, SETTING_HOOK_RATE, (int)HOOK_RATE_NORMAL);
 	obs_data_set_default_string(settings, SETTING_RGBA10A2_SPACE, RGBA10A2_SPACE_SRGB);
 	obs_data_set_default_bool(settings, SETTING_FRAME_LOG, false);
-	obs_data_set_default_int(settings, SETTING_FRAME_RING, 8);
+	obs_data_set_default_int(settings, SETTING_FRAME_RING, FRAME_RING_MAX);
 	obs_data_set_default_bool(settings, SETTING_BUFFERING, true);
 	obs_data_set_default_int(settings, SETTING_BUFFER_DELAY, 2);
 }

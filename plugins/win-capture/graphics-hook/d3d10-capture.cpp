@@ -360,7 +360,7 @@ void d3d10_capture(void *swap_ptr, void *backbuffer_ptr)
 	IDXGISwapChain *swap = (IDXGISwapChain *)swap_ptr;
 
 	HRESULT hr;
-	if (capture_should_stop()) {
+	if (capture_should_stop() || capture_ring_resize_wanted(data.shtex_info)) {
 		d3d10_free();
 	}
 	if (capture_should_init()) {

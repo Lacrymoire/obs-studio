@@ -340,7 +340,7 @@ void d3d12_capture(void *swap_ptr, void *)
 {
 	IDXGISwapChain *swap = (IDXGISwapChain *)swap_ptr;
 
-	if (capture_should_stop()) {
+	if (capture_should_stop() || capture_ring_resize_wanted(data.shtex_info)) {
 		d3d12_free();
 	}
 	if (capture_should_init()) {

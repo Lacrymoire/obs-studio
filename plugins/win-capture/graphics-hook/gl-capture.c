@@ -732,7 +732,7 @@ static void gl_capture(HDC hdc)
 	/* reset error flag */
 	glGetError();
 
-	if (capture_should_stop()) {
+	if (capture_should_stop() || capture_ring_resize_wanted(data.shtex_info)) {
 		gl_free();
 	}
 	if (capture_should_init()) {
