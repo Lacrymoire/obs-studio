@@ -1886,7 +1886,9 @@ static void flog_tick(struct game_capture *gc)
 			else
 				warn("frame log: the hook's shared data block has no present log (log_version=%" PRIu32
 				     "); the graphics-hook DLL loaded in the game is not this build's (see the "
-				     "'injecting graphics hook' line above); restart the game",
+				     "'injecting graphics hook' line above, or the 'frame-lock: ... graphics hook' "
+				     "lines at startup for the copy Vulkan/OpenGL games load at start); restart the "
+				     "game",
 				     gc->shtex_data->log_version);
 		}
 		return;

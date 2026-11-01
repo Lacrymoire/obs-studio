@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <string.h>
 #include <strsafe.h>
 #include <shlobj.h>
 #include <aclapi.h>
@@ -109,6 +110,46 @@ static inline bool file_exists(const wchar_t *path)
 		return false;
 	FindClose(h);
 	return true;
+}
+
+/* Frame-locked build: byte-for-byte comparison of two files (false when either
+ * cannot be read).  Used to keep the %ProgramData% hook copy identical to the
+ * one shipped with this build, see update_hook_file(). */
+static bool files_identical(const wchar_t *a, const wchar_t *b)
+{
+	HANDLE ha = CreateFileW(a, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+				OPEN_EXISTING, 0, NULL);
+	HANDLE hb = CreateFileW(b, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+				OPEN_EXISTING, 0, NULL);
+	bool same = false;
+
+	if (ha != INVALID_HANDLE_VALUE && hb != INVALID_HANDLE_VALUE) {
+		LARGE_INTEGER sa, sb;
+		if (GetFileSizeEx(ha, &sa) && GetFileSizeEx(hb, &sb) && sa.QuadPart == sb.QuadPart) {
+			static BYTE ba[65536], bb[65536];
+			DWORD na, nb;
+			same = true;
+			for (;;) {
+				if (!ReadFile(ha, ba, sizeof(ba), &na, NULL) ||
+				    !ReadFile(hb, bb, sizeof(bb), &nb, NULL) || na != nb) {
+					same = false;
+					break;
+				}
+				if (na == 0)
+					break;
+				if (memcmp(ba, bb, na) != 0) {
+					same = false;
+					break;
+				}
+			}
+		}
+	}
+
+	if (ha != INVALID_HANDLE_VALUE)
+		CloseHandle(ha);
+	if (hb != INVALID_HANDLE_VALUE)
+		CloseHandle(hb);
+	return same;
 }
 
 static LSTATUS get_reg(HKEY hkey, LPCWSTR sub_key, LPCWSTR value_name, bool b64)
@@ -278,6 +319,27 @@ static bool update_hook_file(bool b64)
 	if (ver_dst.major > ver_src.major) {
 		warn("target %ls has major version %d, source has major version %d", dst, ver_dst.major, ver_src.major);
 		return false;
+	}
+
+	/* Frame-locked build: the %ProgramData% copy is not only an injection
+	 * source.  It is the DLL the Vulkan loader loads into every Vulkan (and
+	 * many OpenGL) game at start, through the implicit layer registered in
+	 * init_vulkan_registry(), and a game that already carries a hook DLL is
+	 * never injected with ours (attempt_existing_hook).  Stock OBS replaces
+	 * the copy only when the file version rises, and this build carries the
+	 * stock version, so the stock hook (no frame ring, no present log) kept
+	 * being loaded.  Keep the copy identical to ours instead. */
+	if (!files_identical(src, dst) || !files_identical(src_json, dst_json)) {
+		if (!CopyFileW(src_json, dst_json, false) || !CopyFileW(src, dst, false)) {
+			warn("frame-lock: could not update %ls to this build's hook (%lu); a running Vulkan or "
+			     "OpenGL program may hold it open: close them and restart OBS, or Vulkan/OpenGL games "
+			     "will load the old hook without the present log",
+			     dst, GetLastError());
+		} else {
+			blog(LOG_INFO, "frame-lock: updated %ls to this build's graphics hook", dst);
+		}
+	} else {
+		blog(LOG_INFO, "frame-lock: %ls is this build's graphics hook", dst);
 	}
 
 	return true;
