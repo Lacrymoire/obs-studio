@@ -1,9 +1,12 @@
 #include <windows.h>
+#include <detours.h>
 #include "graphics-hook.h"
 
 #define VK_USE_PLATFORM_WIN32_KHR
 
 #include <malloc.h>
+#include <stdio.h>
+#include <string.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
@@ -131,6 +134,9 @@ struct vk_data {
 };
 
 __declspec(thread) int vk_presenting = 0;
+/* non-zero while a present runs through the hook installed above the
+ * layer chain, which has already copied the frame (see outer_present) */
+__declspec(thread) int vk_present_captured_above = 0;
 
 /* ------------------------------------------------------------------------- */
 
@@ -1170,6 +1176,8 @@ static inline bool valid_rect(struct vk_swap_data *swap)
 	return !!swap->image_extent.width && !!swap->image_extent.height;
 }
 
+static void vk_outer_hooks_install(struct vk_data *data);
+
 static void vk_capture(struct vk_data *data, VkQueue queue, const VkPresentInfoKHR *info)
 {
 	struct vk_swap_data *swap = NULL;
@@ -1202,10 +1210,16 @@ static void vk_capture(struct vk_data *data, VkQueue queue, const VkPresentInfoK
 		vk_shtex_free(data);
 	}
 	if (capture_should_init()) {
-		if (valid_rect(swap) && !vk_shtex_init(data, window, swap)) {
-			vk_shtex_free(data);
-			data->valid = false;
-			flog("vk_shtex_init failed");
+		if (valid_rect(swap)) {
+			if (!vk_shtex_init(data, window, swap)) {
+				vk_shtex_free(data);
+				data->valid = false;
+				flog("vk_shtex_init failed");
+			} else if (!global_hook_info->capture_overlay) {
+				/* overlays off: from now on take the frame above
+				 * the layer chain, before RTSS draws (below) */
+				vk_outer_hooks_install(data);
+			}
 		}
 	}
 	if (capture_ready()) {
@@ -1218,13 +1232,232 @@ static void vk_capture(struct vk_data *data, VkQueue queue, const VkPresentInfoK
 	}
 }
 
+/* ======================================================================== */
+/* present hook above the layer chain (third-party overlay exclusion)       */
+
+/* RTSS draws its on-screen display from a hook that sits above the whole
+ * Vulkan layer chain: its bootstrap layer (VK_LAYER_RTSS) only watches
+ * device and swap chain creation, and the renderer in RTSSHooks64.dll is a
+ * classic API hook on the present entry points the game calls.  A layer
+ * therefore copies the back buffer only after the overlay is on it,
+ * whatever the layer order is.  With "Capture third-party overlays" off we
+ * take the frame the way the D3D hooks do when they hook after RTSS: detour
+ * the present entry points the game actually calls (the vulkan-1.dll export
+ * and the top-of-chain function vkGetDeviceProcAddr hands out), installed
+ * when the capture starts, so our detour runs first and the copy is queued
+ * before the overlay is drawn.  The chain function OBS_QueuePresentKHR then
+ * sees vk_present_captured_above and leaves the frame alone. */
+
+typedef VkResult(VKAPI_PTR *PFN_obs_present)(VkQueue queue, const VkPresentInfoKHR *info);
+
+static VkResult VKAPI_CALL OBS_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info);
+
+#define OUTER_TARGET_MAX 8
+
+static SRWLOCK outer_lock = SRWLOCK_INIT;
+static PFN_obs_present real_present_export = NULL;
+static PFN_obs_present real_present_top = NULL;
+static const void *outer_targets[OUTER_TARGET_MAX];
+static int outer_target_count = 0;
+
+static const char *module_of(const void *addr, char *buf, size_t size)
+{
+	HMODULE mod = NULL;
+	wchar_t path[MAX_PATH];
+
+	if (addr &&
+	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCWSTR)addr, &mod) &&
+	    GetModuleFileNameW(mod, path, MAX_PATH)) {
+		const wchar_t *base = wcsrchr(path, L'\\');
+		snprintf(buf, size, "%ls", base ? base + 1 : path);
+	} else {
+		snprintf(buf, size, "an unknown module");
+	}
+	return buf;
+}
+
+/* the first instruction of a function that someone else has detoured is a
+ * jump (RTSS patches entry points this way, Detours too, sometimes through
+ * a near stub); follow such jumps to where the code really goes */
+static bool code_readable(const void *p, size_t n)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+	    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+		return false;
+	return (const uint8_t *)p + n <= (const uint8_t *)mbi.BaseAddress + mbi.RegionSize;
+}
+
+static const void *jump_target(const uint8_t *p)
+{
+	if (!code_readable(p, 12))
+		return NULL;
+	if (p[0] == 0xE9) /* jmp rel32 */
+		return p + 5 + *(const int32_t *)(p + 1);
+	if (p[0] == 0xFF && p[1] == 0x25) { /* jmp [mem] */
+#ifdef _WIN64
+		const void *const *slot = (const void *const *)(p + 6 + *(const int32_t *)(p + 2));
+#else
+		const void *const *slot = (const void *const *)(uintptr_t)(*(const uint32_t *)(p + 2));
+#endif
+		return code_readable(slot, sizeof(*slot)) ? *slot : NULL;
+	}
+	if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) /* mov rax, imm64; jmp rax */
+		return *(const void *const *)(p + 2);
+	if (p[0] == 0x68 && p[5] == 0xC3) /* push imm32; ret */
+		return (const void *)(uintptr_t)(*(const uint32_t *)(p + 1));
+	return NULL;
+}
+
+static const void *follow_jumps(const void *fn)
+{
+	const void *cur = fn;
+	for (int hops = 0; hops < 4 && cur; hops++) {
+		const void *next = jump_target(cur);
+		if (!next)
+			break;
+		cur = next;
+	}
+	return cur ? cur : fn;
+}
+
+static bool entry_is_patched(const void *fn, const void **target)
+{
+	*target = follow_jumps(fn);
+	return *target != fn;
+}
+
+static VkResult outer_present(VkQueue queue, const VkPresentInfoKHR *info, PFN_obs_present real)
+{
+	/* the outermost of our detours takes the frame unless the user asked
+	 * for the overlays; nested ones and the chain function then skip it */
+	const bool take = vk_present_captured_above == 0 && !global_hook_info->capture_overlay;
+
+	if (take) {
+		struct vk_data *const data = get_device_data_by_queue(queue);
+		if (data && data->valid) {
+			struct vk_queue_data *const queue_data = get_queue_data(data, queue);
+			if (queue_data && queue_data->supports_transfer)
+				vk_capture(data, queue, info);
+		}
+		vk_present_captured_above++;
+	}
+
+	VkResult res = real(queue, info);
+
+	if (take)
+		vk_present_captured_above--;
+	return res;
+}
+
+static VkResult VKAPI_CALL outer_present_export(VkQueue queue, const VkPresentInfoKHR *info)
+{
+	return outer_present(queue, info, real_present_export);
+}
+
+static VkResult VKAPI_CALL outer_present_top(VkQueue queue, const VkPresentInfoKHR *info)
+{
+	return outer_present(queue, info, real_present_top);
+}
+
+static bool outer_target_seen(const void *fn)
+{
+	for (int i = 0; i < outer_target_count; i++) {
+		if (outer_targets[i] == fn)
+			return true;
+	}
+	if (outer_target_count < OUTER_TARGET_MAX)
+		outer_targets[outer_target_count++] = fn;
+	return false;
+}
+
+static bool outer_attach(PFN_obs_present *real, PFN_obs_present target, PFN_obs_present detour, const char *what)
+{
+	*real = target;
+	DetourTransactionBegin();
+	DetourAttach((PVOID *)real, (PVOID)detour);
+	const LONG error = DetourTransactionCommit();
+	if (error != NO_ERROR) {
+		flog("frame-lock: could not hook the %s present (%ld); overlays drawn above the layer chain stay in "
+		     "the capture",
+		     what, error);
+		*real = NULL;
+		return false;
+	}
+	return true;
+}
+
+static void vk_outer_hooks_install(struct vk_data *data)
+{
+	char m1[64], m2[64];
+	const void *jmp = NULL;
+	int hooked = 0;
+
+	AcquireSRWLockExclusive(&outer_lock);
+
+	const HMODULE loader = GetModuleHandleW(L"vulkan-1.dll");
+	const PFN_obs_present export_fn = loader ? (PFN_obs_present)GetProcAddress(loader, "vkQueuePresentKHR") : NULL;
+	const PFN_vkGetDeviceProcAddr gdpa =
+		loader ? (PFN_vkGetDeviceProcAddr)GetProcAddress(loader, "vkGetDeviceProcAddr") : NULL;
+	const PFN_obs_present top_fn = gdpa ? (PFN_obs_present)gdpa(data->device, "vkQueuePresentKHR") : NULL;
+	const bool ours = top_fn == (PFN_obs_present)OBS_QueuePresentKHR;
+
+	const bool new_export = export_fn && !outer_target_seen(export_fn);
+	const bool new_top = top_fn && top_fn != export_fn && !outer_target_seen(top_fn);
+	if (!new_export && !new_top)
+		goto done;
+
+	if (!loader)
+		flog("frame-lock: vulkan-1.dll is not loaded by name; cannot hook the present above the layer chain");
+
+	if (export_fn) {
+		const bool patched = entry_is_patched(export_fn, &jmp);
+		flog("frame-lock: vulkan-1!vkQueuePresentKHR at %p%s%s", export_fn,
+		     patched ? ", entry already detoured into " : "", patched ? module_of(jmp, m1, sizeof(m1)) : "");
+	}
+	if (top_fn) {
+		const bool patched = entry_is_patched(top_fn, &jmp);
+		flog("frame-lock: present function handed to the game at %p in %s%s%s%s", top_fn,
+		     module_of(top_fn, m1, sizeof(m1)), ours ? " (this layer)" : "",
+		     patched ? ", entry already detoured into " : "", patched ? module_of(jmp, m2, sizeof(m2)) : "");
+	}
+	flog("frame-lock: RTSS hooks %s in this process",
+	     (GetModuleHandleW(L"RTSSHooks64.dll") || GetModuleHandleW(L"RTSSHooks.dll")) ? "are loaded" : "not loaded");
+
+	if (new_export && outer_attach(&real_present_export, export_fn, outer_present_export, "vulkan-1 export"))
+		hooked++;
+
+	/* our own chain function needs no second detour unless someone has
+	 * already patched its entry (then they run first and we must get ahead).
+	 * Detours skips an entry jump and patches its destination, so when the
+	 * export jumped into the same function the first detour covers it. */
+	if (new_top && (!ours || entry_is_patched(top_fn, &jmp))) {
+		if (follow_jumps(top_fn) == (const void *)outer_present_export)
+			flog("frame-lock: the present handed to the game is where the export jumps, hooked already");
+		else if (real_present_top)
+			flog("frame-lock: a second top-of-chain present (%p) is not hooked, one slot only", top_fn);
+		else if (outer_attach(&real_present_top, top_fn, outer_present_top, "top-of-chain"))
+			hooked++;
+	}
+
+	if (hooked)
+		flog("frame-lock: present hooked above the layer chain (%d entr%s): third-party overlays drawn there "
+		     "are left out of the capture",
+		     hooked, hooked == 1 ? "y" : "ies");
+
+done:
+	ReleaseSRWLockExclusive(&outer_lock);
+}
+
 static VkResult VKAPI_CALL OBS_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
 {
 	struct vk_data *const data = get_device_data_by_queue(queue);
 	struct vk_queue_data *const queue_data = get_queue_data(data, queue);
 	struct vk_device_funcs *const funcs = &data->funcs;
 
-	if (data->valid && queue_data->supports_transfer) {
+	/* the hook above the layer chain may have taken this frame already */
+	if (vk_present_captured_above == 0 && data->valid && queue_data->supports_transfer) {
 		vk_capture(data, queue, info);
 	}
 
