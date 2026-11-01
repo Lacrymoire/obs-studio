@@ -290,7 +290,7 @@ static size_t mp4_write_mdhd(struct mp4_mux *mux, struct mp4_track *track)
 		s_wb64(s, mux->creation_time); // creation time
 		s_wb64(s, mux->creation_time); // modification time
 		s_wb32(s, timescale);          // timescale
-		s_wb64(s, (uint32_t)duration); // duration
+		s_wb64(s, duration);           // duration (64-bit: the cast that was here truncated it)
 	} else {
 		s_wb32(s, (uint32_t)mux->creation_time); // creation time
 		s_wb32(s, (uint32_t)mux->creation_time); // modification time

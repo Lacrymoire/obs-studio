@@ -153,8 +153,11 @@ static void *gpu_encode_thread(void *data)
 			 */
 			fer_ts = os_gettime_ns();
 
-			/* game-clock output: real-time pts from the frame timestamp */
+			/* game-clock output: real-time pts from the frame timestamp;
+			 * the retime mark goes in before the encode, which may hand
+			 * this frame's packet back at once (no reordering delay) */
 			const int64_t pts = video_frame_pts(encoder, timestamp);
+			retime_mark_frame(encoder, timestamp, pts);
 
 			profile_start(gpu_encode_frame_name);
 			if (encoder->info.encode_texture2) {
@@ -195,7 +198,6 @@ static void *gpu_encode_thread(void *data)
 
 			lock_key = next_key;
 
-			retime_mark_frame(encoder, timestamp, pts);
 			encoder->cur_pts += encoder->timebase_num * encoder->frame_rate_divisor;
 		}
 

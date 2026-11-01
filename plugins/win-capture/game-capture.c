@@ -1619,6 +1619,10 @@ static void ring_tick(struct game_capture *gc)
 	for (uint64_t i = read; i < count; i++) {
 		const uint64_t counter = shtex->present_log[i % PRESENT_LOG_SIZE].counter;
 		const uint64_t time_ns = shtex->present_log[i % PRESENT_LOG_SIZE].time_ns;
+
+		if (counter != i + 1)
+			continue; /* overwritten by a newer present while this tick was late (counted in lost) */
+
 		const uint64_t paced = lock_pace(gc, time_ns); /* Phase 8: bursts paced out */
 		const uint64_t v = lock_add(gc, counter, paced);
 
@@ -2304,8 +2308,6 @@ static void game_capture_update(void *data, obs_data_t *settings)
 		     gc->config.buffering ? "on" : "off", gc->config.buffer_delay, gc->config.buffer_delay == 1 ? "" : "s",
 		     delay_ms, delay_ms, gc->config.frame_ring, gc->config.frame_log ? "on" : "off");
 	}
-	if (!gc->config.frame_log)
-		flog_close(gc, "log disabled");
 	gc->retry_interval = DEFAULT_RETRY_INTERVAL * hook_rate_to_float(gc->config.hook_rate);
 	gc->wait_for_target_startup = false;
 	gc->is_10a2_2100pq = gc->config.is_10a2_2100pq;
@@ -3366,6 +3368,12 @@ static inline bool init_shtex_capture(struct game_capture *gc)
 	gc->extra_texrender = NULL;
 	gs_texture_destroy(gc->extra_texture);
 	gc->extra_texture = NULL;
+	/* frame-locked capture: a capture that re-initializes inside the same
+	 * hook (swap chain rebuild, alt-tab, renderer switch) comes through here
+	 * again without stop_capture; the old ring's slots have to go first or
+	 * their shared textures stay open (and in video memory) for good.
+	 * ring_free drops gc->texture when it aliases a slot. */
+	ring_free(gc);
 	gs_texture_destroy(gc->texture);
 	gc->texture = NULL;
 	gs_texture_t *const texture = gs_texture_open_shared(gc->shtex_data->tex_handle);

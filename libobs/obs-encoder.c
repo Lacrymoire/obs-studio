@@ -1692,11 +1692,13 @@ static void receive_video(void *param, struct video_data *frame)
 
 	enc_frame.frames = 1;
 	enc_frame.pts = video_frame_pts(encoder, frame->timestamp);
+	/* the mark before the encode: an encoder without reordering delay hands
+	 * this frame's packet back inside do_encode, where send_off_encoder_packet
+	 * looks the mark up (retime_sys_dts_usec) */
+	retime_mark_frame(encoder, frame->timestamp, enc_frame.pts);
 
-	if (do_encode(encoder, &enc_frame, &frame->timestamp)) {
-		retime_mark_frame(encoder, frame->timestamp, enc_frame.pts);
+	if (do_encode(encoder, &enc_frame, &frame->timestamp))
 		encoder->cur_pts += encoder->timebase_num * encoder->frame_rate_divisor;
-	}
 
 wait_for_audio:
 	profile_end(receive_video_name);

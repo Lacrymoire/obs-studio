@@ -253,9 +253,11 @@ static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_in
 			data.capture(swap, backbuffer);
 			backbuffer->Release();
 		}
-
-		dxgi_front_check();
 	}
+	/* at every present, not only while capturing, so the check re-arms when
+	 * a capture ends (as the D3D9 and OpenGL hooks do) */
+	if (!capture_overlay && captured_in_front == 0)
+		dxgi_front_check();
 
 	++dxgi_presenting;
 	const HRESULT hr = RealPresent(swap, sync_interval, flags);
@@ -317,9 +319,11 @@ static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_
 			data.capture(swap, backbuffer);
 			backbuffer->Release();
 		}
-
-		dxgi_front_check();
 	}
+	/* at every present, not only while capturing, so the check re-arms when
+	 * a capture ends (as the D3D9 and OpenGL hooks do) */
+	if (!capture_overlay && captured_in_front == 0)
+		dxgi_front_check();
 
 	++dxgi_presenting;
 	const HRESULT hr = RealPresent1(swap, sync_interval, flags, params);
