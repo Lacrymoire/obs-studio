@@ -44,15 +44,16 @@ struct vk_swap_data {
 	VkExtent2D image_extent;
 	VkFormat format;
 	HWND hwnd;
-	VkImage export_image;
-	bool layout_initialized;
-	VkDeviceMemory export_mem;
+	VkImage export_image[FRAME_RING_MAX];
+	bool layout_initialized[FRAME_RING_MAX];
+	VkDeviceMemory export_mem[FRAME_RING_MAX];
 	VkImage *swap_images;
 	uint32_t image_count;
 
-	HANDLE handle;
+	HANDLE handle[FRAME_RING_MAX];
 	struct shtex_data *shtex_info;
-	ID3D11Texture2D *d3d11_tex;
+	ID3D11Texture2D *d3d11_tex[FRAME_RING_MAX];
+	uint32_t ring_size;
 	bool captured;
 };
 
@@ -457,21 +458,25 @@ static void vk_shtex_free(struct vk_data *data)
 
 	while (swap) {
 		VkDevice device = data->device;
-		if (swap->export_image)
-			data->funcs.DestroyImage(device, swap->export_image, data->ac);
+		for (uint32_t i = 0; i < FRAME_RING_MAX; i++) {
+			if (swap->export_image[i])
+				data->funcs.DestroyImage(device, swap->export_image[i], data->ac);
 
-		if (swap->export_mem)
-			data->funcs.FreeMemory(device, swap->export_mem, NULL);
+			if (swap->export_mem[i])
+				data->funcs.FreeMemory(device, swap->export_mem[i], NULL);
 
-		if (swap->d3d11_tex) {
-			ID3D11Texture2D_Release(swap->d3d11_tex);
+			if (swap->d3d11_tex[i]) {
+				ID3D11Texture2D_Release(swap->d3d11_tex[i]);
+			}
+
+			swap->handle[i] = INVALID_HANDLE_VALUE;
+			swap->d3d11_tex[i] = NULL;
+			swap->export_mem[i] = VK_NULL_HANDLE;
+			swap->export_image[i] = VK_NULL_HANDLE;
+			swap->layout_initialized[i] = false;
 		}
 
-		swap->handle = INVALID_HANDLE_VALUE;
-		swap->d3d11_tex = NULL;
-		swap->export_mem = VK_NULL_HANDLE;
-		swap->export_image = VK_NULL_HANDLE;
-
+		swap->ring_size = 0;
 		swap->captured = false;
 
 		swap = swap_walk_next(swap);
@@ -634,7 +639,7 @@ static inline bool vk_shtex_init_d3d11(struct vk_data *data)
 	return true;
 }
 
-static inline bool vk_shtex_init_d3d11_tex(struct vk_data *data, struct vk_swap_data *swap)
+static inline bool vk_shtex_init_d3d11_tex(struct vk_data *data, struct vk_swap_data *swap, uint32_t slot)
 {
 	IDXGIResource *dxgi_res;
 	HRESULT hr;
@@ -642,8 +647,9 @@ static inline bool vk_shtex_init_d3d11_tex(struct vk_data *data, struct vk_swap_
 	const UINT width = swap->image_extent.width;
 	const UINT height = swap->image_extent.height;
 
-	flog("OBS requesting %s texture format. capture dimensions: %ux%u", vk_format_to_str(swap->format), width,
-	     height);
+	if (slot == 0)
+		flog("OBS requesting %s texture format. capture dimensions: %ux%u", vk_format_to_str(swap->format),
+		     width, height);
 
 	const DXGI_FORMAT format = vk_format_to_dxgi(swap->format);
 	if (format == DXGI_FORMAT_UNKNOWN) {
@@ -663,19 +669,19 @@ static inline bool vk_shtex_init_d3d11_tex(struct vk_data *data, struct vk_swap_
 	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-	hr = ID3D11Device_CreateTexture2D(data->d3d11_device, &desc, NULL, &swap->d3d11_tex);
+	hr = ID3D11Device_CreateTexture2D(data->d3d11_device, &desc, NULL, &swap->d3d11_tex[slot]);
 	if (FAILED(hr)) {
 		flog_hr("failed to create texture", hr);
 		return false;
 	}
 
-	hr = ID3D11Texture2D_QueryInterface(swap->d3d11_tex, &IID_IDXGIResource, &dxgi_res);
+	hr = ID3D11Texture2D_QueryInterface(swap->d3d11_tex[slot], &IID_IDXGIResource, &dxgi_res);
 	if (FAILED(hr)) {
 		flog_hr("failed to get IDXGIResource", hr);
 		return false;
 	}
 
-	hr = IDXGIResource_GetSharedHandle(dxgi_res, &swap->handle);
+	hr = IDXGIResource_GetSharedHandle(dxgi_res, &swap->handle[slot]);
 	IDXGIResource_Release(dxgi_res);
 
 	if (FAILED(hr)) {
@@ -686,10 +692,12 @@ static inline bool vk_shtex_init_d3d11_tex(struct vk_data *data, struct vk_swap_
 	return true;
 }
 
-static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap_data *swap)
+static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap_data *swap, uint32_t slot)
 {
 	struct vk_device_funcs *funcs = &data->funcs;
 	VkExternalMemoryFeatureFlags f = data->external_mem_props.externalMemoryFeatures;
+	VkImage *const export_image = &swap->export_image[slot];
+	VkDeviceMemory *const export_mem = &swap->export_mem[slot];
 
 	/* -------------------------------------------------------- */
 	/* create texture                                           */
@@ -721,14 +729,14 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 	VkDevice device = data->device;
 
 	VkResult res;
-	res = funcs->CreateImage(device, &ici, data->ac, &swap->export_image);
+	res = funcs->CreateImage(device, &ici, data->ac, export_image);
 	if (VK_SUCCESS != res) {
 		flog("failed to CreateImage: %s", result_to_str(res));
-		swap->export_image = VK_NULL_HANDLE;
+		*export_image = VK_NULL_HANDLE;
 		return false;
 	}
 
-	swap->layout_initialized = false;
+	swap->layout_initialized[slot] = false;
 
 	/* -------------------------------------------------------- */
 	/* get image memory requirements                            */
@@ -748,12 +756,12 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 		VkImageMemoryRequirementsInfo2 imri2 = {0};
 		imri2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
 		imri2.pNext = NULL;
-		imri2.image = swap->export_image;
+		imri2.image = *export_image;
 
 		funcs->GetImageMemoryRequirements2(device, &imri2, &mr2);
 		mr = mr2.memoryRequirements;
 	} else {
-		funcs->GetImageMemoryRequirements(device, swap->export_image, &mr);
+		funcs->GetImageMemoryRequirements(device, *export_image, &mr);
 	}
 
 	/* -------------------------------------------------------- */
@@ -772,7 +780,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 	imw32hi.pNext = NULL;
 	imw32hi.name = NULL;
 	imw32hi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
-	imw32hi.handle = swap->handle;
+	imw32hi.handle = swap->handle[slot];
 
 	VkMemoryAllocateInfo mai;
 	mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -785,7 +793,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 	mdai.buffer = VK_NULL_HANDLE;
 
 	if (data->external_mem_props.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) {
-		mdai.image = swap->export_image;
+		mdai.image = *export_image;
 		imw32hi.pNext = &mdai;
 	}
 
@@ -795,7 +803,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 		    (pdmp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ==
 			    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
 			mai.memoryTypeIndex = i;
-			res = funcs->AllocateMemory(device, &mai, NULL, &swap->export_mem);
+			res = funcs->AllocateMemory(device, &mai, NULL, export_mem);
 			allocated = res == VK_SUCCESS;
 			if (allocated)
 				break;
@@ -811,7 +819,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 			    (pdmp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) !=
 				    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
 				mai.memoryTypeIndex = i;
-				res = funcs->AllocateMemory(device, &mai, NULL, &swap->export_mem);
+				res = funcs->AllocateMemory(device, &mai, NULL, export_mem);
 				allocated = res == VK_SUCCESS;
 				if (allocated)
 					break;
@@ -824,8 +832,8 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 
 	if (!allocated) {
 		flog("failed to allocate memory of any type");
-		funcs->DestroyImage(device, swap->export_image, data->ac);
-		swap->export_image = VK_NULL_HANDLE;
+		funcs->DestroyImage(device, *export_image, data->ac);
+		*export_image = VK_NULL_HANDLE;
 		return false;
 	}
 
@@ -837,17 +845,17 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data, struct vk_swap
 	if (use_bi2) {
 		VkBindImageMemoryInfo bimi = {0};
 		bimi.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
-		bimi.image = swap->export_image;
-		bimi.memory = swap->export_mem;
+		bimi.image = *export_image;
+		bimi.memory = *export_mem;
 		bimi.memoryOffset = 0;
 		res = funcs->BindImageMemory2(device, 1, &bimi);
 	} else {
-		res = funcs->BindImageMemory(device, swap->export_image, swap->export_mem, 0);
+		res = funcs->BindImageMemory(device, *export_image, *export_mem, 0);
 	}
 	if (VK_SUCCESS != res) {
 		flog("%s failed: %s", use_bi2 ? "BindImageMemory2" : "BindImageMemory", result_to_str(res));
-		funcs->DestroyImage(device, swap->export_image, data->ac);
-		swap->export_image = VK_NULL_HANDLE;
+		funcs->DestroyImage(device, *export_image, data->ac);
+		*export_image = VK_NULL_HANDLE;
 		return false;
 	}
 	return true;
@@ -858,18 +866,27 @@ static bool vk_shtex_init(struct vk_data *data, HWND window, struct vk_swap_data
 	if (!vk_shtex_init_d3d11(data)) {
 		return false;
 	}
-	if (!vk_shtex_init_d3d11_tex(data, swap)) {
-		return false;
-	}
-	if (!vk_shtex_init_vulkan_tex(data, swap)) {
-		return false;
+
+	swap->ring_size = capture_ring_size_wanted();
+
+	for (uint32_t i = 0; i < swap->ring_size; i++) {
+		if (!vk_shtex_init_d3d11_tex(data, swap, i)) {
+			return false;
+		}
+		if (!vk_shtex_init_vulkan_tex(data, swap, i)) {
+			return false;
+		}
 	}
 
 	data->cur_swap = swap;
 
-	swap->captured = capture_init_shtex(&swap->shtex_info, window, swap->image_extent.width,
-					    swap->image_extent.height, (uint32_t)swap->format, false,
-					    (uintptr_t)swap->handle);
+	uintptr_t handles[FRAME_RING_MAX];
+	for (uint32_t i = 0; i < swap->ring_size; i++)
+		handles[i] = (uintptr_t)swap->handle[i];
+
+	swap->captured = capture_init_shtex_ring(&swap->shtex_info, window, swap->image_extent.width,
+						 swap->image_extent.height, (uint32_t)swap->format, false, handles,
+						 swap->ring_size);
 
 	if (!swap->captured)
 		return false;
@@ -879,7 +896,7 @@ static bool vk_shtex_init(struct vk_data *data, HWND window, struct vk_swap_data
 		     "unsupported; ignoring");
 	}
 
-	hlog("vulkan shared texture capture successful");
+	hlog("vulkan shared texture capture successful (%u slot%s)", swap->ring_size, swap->ring_size == 1 ? "" : "s");
 	return true;
 }
 
@@ -976,6 +993,8 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 
 	const uint32_t image_index = info->pImageIndices[idx];
 	VkImage cur_backbuffer = swap->swap_images[image_index];
+	const uint32_t slot = capture_next_slot(swap->shtex_info);
+	const VkImage export_image = swap->export_image[slot];
 
 	struct vk_queue_data *queue_data = get_queue_data(data, queue);
 	uint32_t fam_idx = queue_data->fam_idx;
@@ -1010,7 +1029,7 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 	/* ------------------------------------------------------ */
 	/* transition shared texture if necessary                 */
 
-	if (!swap->layout_initialized) {
+	if (!swap->layout_initialized[slot]) {
 		VkImageMemoryBarrier imb;
 		imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 		imb.pNext = NULL;
@@ -1020,7 +1039,7 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 		imb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
 		imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		imb.image = swap->export_image;
+		imb.image = export_image;
 		imb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		imb.subresourceRange.baseMipLevel = 0;
 		imb.subresourceRange.levelCount = 1;
@@ -1030,7 +1049,7 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 		funcs->CmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 					  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &imb);
 
-		swap->layout_initialized = true;
+		swap->layout_initialized[slot] = true;
 	}
 
 	/* ------------------------------------------------------ */
@@ -1062,7 +1081,7 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 	dst_mb->newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 	dst_mb->srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
 	dst_mb->dstQueueFamilyIndex = fam_idx;
-	dst_mb->image = swap->export_image;
+	dst_mb->image = export_image;
 	dst_mb->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	dst_mb->subresourceRange.baseMipLevel = 0;
 	dst_mb->subresourceRange.levelCount = 1;
@@ -1093,7 +1112,7 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 	cpy.extent.width = swap->image_extent.width;
 	cpy.extent.height = swap->image_extent.height;
 	cpy.extent.depth = 1;
-	funcs->CmdCopyImage(cmd_buffer, cur_backbuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swap->export_image,
+	funcs->CmdCopyImage(cmd_buffer, cur_backbuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, export_image,
 			    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cpy);
 
 	/* ------------------------------------------------------ */
@@ -1140,8 +1159,10 @@ static void vk_shtex_capture(struct vk_data *data, struct vk_device_funcs *funcs
 	debug_res("QueueSubmit", res);
 #endif
 
-	if (res == VK_SUCCESS)
+	if (res == VK_SUCCESS) {
 		frame_data->cmd_buffer_busy = true;
+		capture_log_present(swap->shtex_info, slot);
+	}
 }
 
 static inline bool valid_rect(struct vk_swap_data *swap)
@@ -1655,13 +1676,16 @@ static VkResult VKAPI_CALL OBS_CreateSwapchainKHR(VkDevice device, const VkSwapc
 				swap_data->image_extent = cinfo->imageExtent;
 				swap_data->format = cinfo->imageFormat;
 				swap_data->hwnd = hwnd;
-				swap_data->export_image = VK_NULL_HANDLE;
-				swap_data->layout_initialized = false;
-				swap_data->export_mem = VK_NULL_HANDLE;
+				for (uint32_t i = 0; i < FRAME_RING_MAX; i++) {
+					swap_data->export_image[i] = VK_NULL_HANDLE;
+					swap_data->layout_initialized[i] = false;
+					swap_data->export_mem[i] = VK_NULL_HANDLE;
+					swap_data->handle[i] = INVALID_HANDLE_VALUE;
+					swap_data->d3d11_tex[i] = NULL;
+				}
 				swap_data->image_count = count;
-				swap_data->handle = INVALID_HANDLE_VALUE;
+				swap_data->ring_size = 0;
 				swap_data->shtex_info = NULL;
-				swap_data->d3d11_tex = NULL;
 				swap_data->captured = false;
 				init_swap_data(swap_data, data, sc);
 			}
