@@ -33,6 +33,8 @@ struct dxgi_swap_data {
 
 static struct dxgi_swap_data data = {};
 
+static inline IUnknown *get_dxgi_backbuffer(IDXGISwapChain *swap);
+
 static struct hook_in_front present_front = {};
 static struct hook_in_front present1_front = {};
 static bool front_checked_active = false;
