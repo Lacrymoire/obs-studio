@@ -746,6 +746,12 @@ bool OBSBasic::InitBasicConfigDefaults()
 	config_set_default_string(activeConfiguration, "Video", "ColorRange", "Partial");
 	config_set_default_uint(activeConfiguration, "Video", "SdrWhiteLevel", 300);
 	config_set_default_uint(activeConfiguration, "Video", "HdrNominalPeakLevel", 1000);
+	/* frame-locked capture: the release records with the game clock and a
+	 * retimed constant frame rate unless basic.ini says otherwise (see
+	 * ResetVideo); without a buffering Game Capture source the ticks stay
+	 * on the nominal grid and the audio follows it unchanged */
+	config_set_default_bool(activeConfiguration, "Video", "GameClockOutput", true);
+	config_set_default_bool(activeConfiguration, "Video", "GameClockRetime", true);
 
 	config_set_default_string(activeConfiguration, "Audio", "MonitoringDeviceId", "default");
 	config_set_default_string(activeConfiguration, "Audio", "MonitoringDeviceName",
