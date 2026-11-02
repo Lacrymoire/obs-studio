@@ -195,6 +195,8 @@ static inline bool d3d9_shtex_init_shtex()
 		hr = data.d3d11_device->CreateTexture2D(&desc, nullptr, (ID3D11Texture2D **)&data.d3d11_tex[i]);
 		if (FAILED(hr)) {
 			hlog_hr("d3d9_shtex_init_shtex: Failed to create D3D11 texture", hr);
+			hlog("d3d9_shtex_init_shtex: slot %u of %u", i, data.ring_size);
+			capture_ring_slot_failed(i);
 			return false;
 		}
 
@@ -260,6 +262,8 @@ static inline bool d3d9_shtex_init_copytex()
 				hlog_hr("d3d9_shtex_init_copytex: Failed to get surface level", hr);
 		} else {
 			hlog_hr("d3d9_shtex_init_copytex: Failed to create shared texture", hr);
+			hlog("d3d9_shtex_init_copytex: slot %u of %u", i, data.ring_size);
+			capture_ring_slot_failed(i);
 		}
 	}
 
@@ -465,7 +469,12 @@ static void d3d9_init(IDirect3DDevice9 *device)
 	}
 
 	if (!success) {
+		/* frame-locked capture: wait before the next attempt, and give a
+		 * ring that does not fit a smaller size (capture_init_failed) */
+		const uint32_t ring_tried = data.using_shtex ? data.ring_size : 0;
+
 		d3d9_free();
+		capture_init_failed(ring_tried);
 	}
 }
 
@@ -636,6 +645,9 @@ static inline bool present_front_begin(IDirect3DDevice9 *device, IDirect3DSurfac
 	}
 
 	d3d9_capture(device, backbuffer);
+	/* the detour skips its checks while we take the copy here, so run
+	 * them here or they stop re-arming once a front hook is in place */
+	d3d9_front_check();
 	++captured_in_front;
 	return true;
 }

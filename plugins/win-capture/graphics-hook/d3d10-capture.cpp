@@ -255,6 +255,7 @@ static bool d3d10_shtex_init(HWND window)
 	for (uint32_t i = 0; i < data.ring_size; i++) {
 		if (!create_d3d10_tex(data.cx, data.cy, &data.texture[i], &data.handle[i])) {
 			hlog("d3d10_shtex_init: failed to create texture (slot %u of %u)", i, data.ring_size);
+			capture_ring_slot_failed(i);
 			return false;
 		}
 		handles[i] = (uintptr_t)data.handle[i];
@@ -288,8 +289,10 @@ static void d3d10_init(IDXGISwapChain *swap)
 
 	const bool success = global_hook_info->force_shmem ? d3d10_shmem_init(window) : d3d10_shtex_init(window);
 	if (!success) {
+		const uint32_t ring_tried = data.using_shtex ? data.ring_size : 0;
+
 		d3d10_free();
-		capture_init_failed();
+		capture_init_failed(ring_tried);
 	}
 }
 

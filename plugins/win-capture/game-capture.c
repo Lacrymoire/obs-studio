@@ -294,6 +294,7 @@ struct game_capture {
 	 * asked of the hook for this capture (hook_info.frame_ring_size), since
 	 * when the current ring has been too small, and when it was last grown */
 	uint32_t ring_wanted;
+	uint32_t ring_cap_logged; /* hook_info.frame_ring_cap last reported */
 	uint64_t ring_need_ns;
 	uint64_t ring_grow_ns;
 	uint64_t vram_log_ns; /* last video-memory log line */
@@ -1400,6 +1401,16 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 
 	memset(&gc->ring, 0, sizeof(gc->ring));
 
+	/* a hook that could not allocate the ring it was asked for limits it
+	 * for the rest of the game (capture_init_failed in the hook) */
+	const uint32_t hook_cap = gc->global_hook_info ? gc->global_hook_info->frame_ring_cap : 0;
+	if (hook_cap && hook_cap < gc->ring_wanted && hook_cap != gc->ring_cap_logged) {
+		gc->ring_cap_logged = hook_cap;
+		warn("frame ring: the game could not create the %" PRIu32 " slots asked for (video or system memory "
+		     "ran out); its ring is limited to %" PRIu32 " slot%s until it exits",
+		     gc->ring_wanted, hook_cap, hook_cap == 1 ? "" : "s");
+	}
+
 	if (n <= 1)
 		return true;
 	if (n > FRAME_RING_MAX) {
@@ -1463,15 +1474,22 @@ static inline uint32_t ring_start_size(const struct game_capture *gc)
 
 static void ring_grow_check(struct game_capture *gc)
 {
-	const uint32_t cap = gc->config.frame_ring;
+	uint32_t cap = gc->config.frame_ring;
 	const uint64_t now = os_gettime_ns();
 	const double interval = (double)obs_get_frame_interval_ns();
 	uint32_t needed = 0;
 	const char *why = "";
 
-	if (!gc->config.buffering || !gc->global_hook_info || gc->ring.size >= cap || !gc->lock.ready ||
-	    gc->lock.fresh)
+	if (!gc->config.buffering || !gc->global_hook_info) {
 		return;
+	}
+	/* the most the hook could allocate in this game (0 = no limit) */
+	if (gc->global_hook_info->frame_ring_cap && gc->global_hook_info->frame_ring_cap < cap) {
+		cap = gc->global_hook_info->frame_ring_cap;
+	}
+	if (gc->ring.size >= cap || !gc->lock.ready || gc->lock.fresh) {
+		return;
+	}
 	if (gc->ring_grow_ns && now - gc->ring_grow_ns < RING_GROW_MIN_NS)
 		return; /* the last request is still being carried out */
 
@@ -2369,6 +2387,11 @@ static inline bool capture_needs_reset(struct game_capture_config *cfg1, struct 
 
 	} else if (cfg1->frame_ring != cfg2->frame_ring) {
 		return true;
+
+	} else if (cfg1->buffering != cfg2->buffering) {
+		/* frame-locked capture: the ring size is chosen at hook time
+		 * (ring_start_size), so turning Buffering on or off re-hooks */
+		return true;
 	}
 
 	return false;
@@ -2710,6 +2733,7 @@ static inline bool init_hook_info(struct game_capture *gc)
 	gc->global_hook_info->allow_srgb_alias = true;
 	/* automatic ring size: start small, ring_grow_check raises it */
 	gc->ring_wanted = ring_start_size(gc);
+	gc->ring_cap_logged = 0;
 	gc->ring_need_ns = 0;
 	gc->ring_grow_ns = 0;
 	gc->global_hook_info->frame_ring_size = gc->ring_wanted;

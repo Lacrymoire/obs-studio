@@ -393,6 +393,7 @@ static inline bool gl_shtex_init_gl_tex(void)
 							   GL_TEXTURE_2D, WGL_ACCESS_WRITE_DISCARD_NV);
 		if (!data.gl_dxobj[i]) {
 			hlog("gl_shtex_init_gl_tex: failed to register object (slot %u of %u)", i, data.ring_size);
+			capture_ring_slot_failed(i);
 			return false;
 		}
 	}
@@ -421,6 +422,7 @@ static bool gl_shtex_init(HWND window)
 	for (uint32_t i = 0; i < data.ring_size; i++) {
 		if (!gl_shtex_init_d3d11_tex(i)) {
 			hlog("gl_shtex_init: failed to create texture (slot %u of %u)", i, data.ring_size);
+			capture_ring_slot_failed(i);
 			return false;
 		}
 		handles[i] = (uintptr_t)data.handle[i];
@@ -550,10 +552,23 @@ static int gl_init(HDC hdc)
 		success = gl_shmem_init(window);
 	}
 
-	if (!success)
-		gl_free();
-	else
+	if (success) {
 		ret = INIT_SUCCESS;
+	} else {
+		/* frame-locked capture: a ring that did not fit (a slot after
+		 * the first failed) is tried again smaller after a pause
+		 * (capture_init_failed) instead of falling back to memory
+		 * capture, which has no ring; any other shared texture failure
+		 * keeps the stock fallback */
+		const uint32_t ring_tried = data.using_shtex ? data.ring_size : 0;
+		const bool ring_short = data.using_shtex && capture_ring_failed_slot > 0;
+
+		gl_free();
+		if (ret != INIT_SHTEX_FAILED || ring_short) {
+			capture_init_failed(ring_tried);
+			ret = INIT_FAILED;
+		}
+	}
 
 	return ret;
 }
@@ -796,6 +811,9 @@ static inline bool gl_swap_front_begin(HDC hdc)
 		return false;
 
 	gl_capture(hdc);
+	/* the detour skips its checks while we take the copy here, so run
+	 * them here or they stop re-arming once a front hook is in place */
+	gl_front_check();
 	++captured_in_front;
 	return true;
 }

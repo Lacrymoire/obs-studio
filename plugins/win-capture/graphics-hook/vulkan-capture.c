@@ -871,10 +871,9 @@ static bool vk_shtex_init(struct vk_data *data, HWND window, struct vk_swap_data
 	swap->ring_size = capture_ring_size_wanted();
 
 	for (uint32_t i = 0; i < swap->ring_size; i++) {
-		if (!vk_shtex_init_d3d11_tex(data, swap, i)) {
-			return false;
-		}
-		if (!vk_shtex_init_vulkan_tex(data, swap, i)) {
+		if (!vk_shtex_init_d3d11_tex(data, swap, i) || !vk_shtex_init_vulkan_tex(data, swap, i)) {
+			hlog("vk_shtex_init: failed to create slot %u of %u", i, swap->ring_size);
+			capture_ring_slot_failed(i);
 			return false;
 		}
 	}
@@ -1207,9 +1206,20 @@ static void vk_capture(struct vk_data *data, VkQueue queue, const VkPresentInfoK
 	if (capture_should_init()) {
 		if (valid_rect(swap)) {
 			if (!vk_shtex_init(data, window, swap)) {
+				/* frame-locked capture: a ring that did not fit (a
+				 * slot after the first failed) is tried again smaller
+				 * after a pause (capture_init_failed); any other
+				 * failure ends capture of this device as in stock */
+				const uint32_t ring_tried = swap->ring_size;
+				const bool ring_short = capture_ring_failed_slot > 0;
+
 				vk_shtex_free(data);
-				data->valid = false;
 				flog("vk_shtex_init failed");
+				if (ring_short) {
+					capture_init_failed(ring_tried);
+				} else {
+					data->valid = false;
+				}
 			} else if (!global_hook_info->capture_overlay) {
 				/* overlays off: from now on take the frame above
 				 * the layer chain, before RTSS draws (below) */

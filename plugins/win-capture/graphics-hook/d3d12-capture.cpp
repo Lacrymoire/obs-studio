@@ -98,6 +98,7 @@ static bool create_d3d12_tex(UINT count)
 		if (FAILED(hr)) {
 			hlog_hr("create_d3d12_tex: creation of d3d11 copy tex failed", hr);
 			hlog("create_d3d12_tex: slot %u of %u", i, data.ring_size);
+			capture_ring_slot_failed(i);
 			return false;
 		}
 
@@ -301,9 +302,11 @@ static void d3d12_init(IDXGISwapChain *swap)
 			}
 
 			if (!d3d12_shtex_init(device, window, count)) {
+				const uint32_t ring_tried = data.ring_size;
+
 				d3d12_log_video_memory(device, "capture init failed");
 				d3d12_free();
-				capture_init_failed();
+				capture_init_failed(ring_tried);
 			}
 		}
 

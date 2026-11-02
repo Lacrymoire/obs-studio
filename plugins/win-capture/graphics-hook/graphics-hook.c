@@ -61,6 +61,10 @@ static struct thread_data thread_data = {0};
 
 volatile bool active = false;
 uint64_t capture_init_retry_ns = 0; /* frame-locked capture: see capture_init_failed */
+uint32_t capture_ring_cap = FRAME_RING_MAX; /* frame-locked capture: see capture_ring_slot_failed */
+uint32_t capture_ring_good = 0;
+uint32_t capture_ring_failed_slot = 0;
+uint32_t capture_init_failures = 0;
 struct hook_info *global_hook_info = NULL;
 
 static inline void wait_for_dll_main_finish(HANDLE thread_handle)
@@ -186,6 +190,7 @@ static inline bool init_hook_info(void)
 		hlog("Failed to map the hook info file mapping: %lu", GetLastError());
 		return false;
 	}
+	global_hook_info->frame_ring_cap = 0; /* frame-locked capture: no ring limit yet in this process */
 
 	return true;
 }
@@ -553,6 +558,9 @@ uint32_t capture_ring_size_wanted(void)
 		n = 1;
 	if (n > FRAME_RING_MAX)
 		n = FRAME_RING_MAX;
+	if (n > capture_ring_cap) {
+		n = capture_ring_cap; /* a larger ring did not fit (capture_init_failed) */
+	}
 	return n;
 }
 
@@ -607,6 +615,8 @@ bool capture_init_shtex_ring(struct shtex_data **data, HWND window, uint32_t cx,
 	}
 
 	active = true;
+	capture_ring_good = count;
+	capture_init_failures = 0;
 	return true;
 }
 
@@ -797,6 +807,7 @@ bool capture_init_shmem(struct shmem_data **data, HWND window, uint32_t cx, uint
 	}
 
 	active = true;
+	capture_init_failures = 0;
 	return true;
 }
 
@@ -914,6 +925,32 @@ const void *hook_follow_jumps(const void *fn)
 	return cur ? cur : fn;
 }
 
+/* snprintf's %ls converts with the C runtime's locale, which gives an empty or
+ * cut string for a path with characters outside it (a game folder with
+ * Turkish letters); the log is UTF-8 anyway */
+const char *hook_wide_to_utf8(const wchar_t *src, char *buf, size_t size)
+{
+	char tmp[MAX_PATH * 3 + 1];
+	size_t len;
+
+	if (!buf || !size) {
+		return buf;
+	}
+	if (!src || WideCharToMultiByte(CP_UTF8, 0, src, -1, tmp, (int)sizeof(tmp), NULL, NULL) <= 0) {
+		strcpy_s(tmp, sizeof(tmp), "(unreadable name)");
+	}
+	len = strlen(tmp);
+	if (len >= size) {
+		len = size - 1;
+		while (len && ((unsigned char)tmp[len] & 0xC0) == 0x80) {
+			len--; /* do not cut a character in half */
+		}
+	}
+	memcpy(buf, tmp, len);
+	buf[len] = 0;
+	return buf;
+}
+
 const char *hook_module_name(const void *addr, char *buf, size_t size)
 {
 	HMODULE mod = NULL;
@@ -924,7 +961,7 @@ const char *hook_module_name(const void *addr, char *buf, size_t size)
 			       (LPCWSTR)addr, &mod) &&
 	    GetModuleFileNameW(mod, path, MAX_PATH)) {
 		const wchar_t *base = wcsrchr(path, L'\\');
-		snprintf(buf, size, "%ls", base ? base + 1 : path);
+		hook_wide_to_utf8(base ? base + 1 : path, buf, size);
 	} else {
 		snprintf(buf, size, "an unknown module");
 	}
@@ -943,7 +980,7 @@ const char *hook_module_path(const void *addr, char *buf, size_t size)
 	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 			       (LPCWSTR)addr, &mod) &&
 	    GetModuleFileNameW(mod, path, MAX_PATH)) {
-		snprintf(buf, size, "%ls", path);
+		hook_wide_to_utf8(path, buf, size);
 	} else {
 		snprintf(buf, size, "an unknown module");
 	}

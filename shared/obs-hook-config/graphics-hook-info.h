@@ -150,8 +150,11 @@ struct hook_info {
 
 	/* frame-locked capture: slots the hook should allocate (1 = stock single texture) */
 	uint32_t frame_ring_size;
+	/* frame-locked capture, written by the hook: the largest ring it could
+	 * allocate in this game process after a slot failed (0 = no limit) */
+	uint32_t frame_ring_cap;
 
-	uint32_t reserved[125];
+	uint32_t reserved[124];
 };
 static_assert(sizeof(struct hook_info) == 648, "ABI compatibility");
 

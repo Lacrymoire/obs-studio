@@ -84,6 +84,8 @@ static inline bool dxgi_capture_in_front(IDXGISwapChain *swap, UINT flags)
 struct vtable_front {
 	void **slot;     /* the table entry we replaced, NULL until installed */
 	void *real;      /* what was in the entry (the overlay's function) */
+	void *real_base; /* allocation (module) that holds it, see vtable_front_next */
+	DWORD real_type; /* its memory type (MEM_IMAGE for a DLL) */
 	void *ours;      /* our front function */
 	void *target;    /* the function we detoured (the stock table entry) */
 	void *inner;     /* our detour on it */
@@ -98,10 +100,12 @@ static HRESULT STDMETHODCALLTYPE hook_present_vt_front(IDXGISwapChain *swap, UIN
 static HRESULT STDMETHODCALLTYPE hook_present1_vt_front(IDXGISwapChain1 *swap, UINT sync_interval, UINT flags,
 							const DXGI_PRESENT_PARAMETERS *params);
 
-static struct vtable_front vt_present = {nullptr, nullptr,  (void *)hook_present_vt_front, nullptr, nullptr,
-					 nullptr, 8,        "IDXGISwapChain::Present",      false,   false};
-static struct vtable_front vt_present1 = {nullptr, nullptr, (void *)hook_present1_vt_front, nullptr, nullptr,
-					  nullptr, 22,      "IDXGISwapChain1::Present1",    false,   false};
+static struct vtable_front vt_present = {nullptr, nullptr, nullptr, 0, (void *)hook_present_vt_front,
+					 nullptr, nullptr, nullptr, 8, "IDXGISwapChain::Present",
+					 false,   false};
+static struct vtable_front vt_present1 = {nullptr, nullptr, nullptr, 0,  (void *)hook_present1_vt_front,
+					  nullptr, nullptr, nullptr, 22, "IDXGISwapChain1::Present1",
+					  false,   false};
 static bool vt_checked_active = false;
 
 static void dxgi_log_overlay_modules(void)
@@ -131,8 +135,16 @@ static void dxgi_log_overlay_modules(void)
 			continue;
 		if (runtime && windir_len && _wcsnicmp(path, windir, windir_len) == 0)
 			continue;
-		char narrow[MAX_PATH + 8];
-		snprintf(narrow, sizeof(narrow), "%s%ls", list[0] ? ", " : "", runtime ? path : names[i]);
+		char narrow[MAX_PATH * 3 + 1];
+		hook_wide_to_utf8(runtime ? path : names[i], narrow, sizeof(narrow));
+		/* a list that would overflow ends with "..." instead */
+		if (strlen(list) + strlen(narrow) + 10 >= sizeof(list)) {
+			strcat_s(list, ", ...");
+			break;
+		}
+		if (list[0]) {
+			strcat_s(list, ", ");
+		}
 		strcat_s(list, narrow);
 	}
 	hlog("frame-lock: overlay and frame-generation modules in this process: %s", list[0] ? list : "none");
@@ -177,6 +189,11 @@ static void vtable_front_check(struct vtable_front *f, IDXGISwapChain *swap)
 		f->failed = true;
 		return;
 	}
+	MEMORY_BASIC_INFORMATION mbi = {};
+	if (VirtualQuery(entry, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+		f->real_base = mbi.AllocationBase;
+		f->real_type = mbi.Type;
+	}
 	f->real = entry;
 	f->slot = &table[f->index];
 	f->last_seen = f->ours;
@@ -205,12 +222,59 @@ static inline void dxgi_vt_front_check(IDXGISwapChain *swap)
 		vtable_front_check(&vt_present1, swap);
 }
 
+/* the checks hook_present runs, for a front function that took the copy: the
+ * detour skips them then (captured_in_front), so without this they would stop
+ * re-arming once a front hook is in place */
+static inline void dxgi_front_checks_in_front(IDXGISwapChain *swap)
+{
+	dxgi_front_check();
+	dxgi_vt_front_check(swap);
+}
+
+/* What our method-table front calls after its copy: the function that was in
+ * the entry, while the allocation holding it (the overlay's DLL) is still
+ * mapped.  A module that is unloaded while our front sits in the table (and so
+ * cannot restore its own entry) would leave that pointer dangling and crash the
+ * game at its next present; then put the function we detoured back into the
+ * entry and call that.  VirtualQuery rather than GetModuleHandleEx, so a
+ * present never takes the loader lock. */
+static void *vtable_front_next(struct vtable_front *f)
+{
+	MEMORY_BASIC_INFORMATION mbi = {};
+
+	if (f->real == f->target) {
+		return f->target; /* already put back (a call that was on its way) */
+	}
+	if (VirtualQuery(f->real, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT &&
+	    mbi.AllocationBase == f->real_base && mbi.Type == f->real_type) {
+		return f->real;
+	}
+
+	hlog("frame-lock: %s: the module we hooked in front of in the method table was unloaded; putting the "
+	     "stock entry back",
+	     f->name);
+	if (f->slot && *f->slot == f->ours) {
+		DWORD old = 0;
+		if (VirtualProtect(f->slot, sizeof(void *), PAGE_EXECUTE_READWRITE, &old)) {
+			InterlockedCompareExchangePointer(f->slot, f->target, f->ours);
+			VirtualProtect(f->slot, sizeof(void *), old, &old);
+		}
+	}
+	f->real = f->target; /* stays valid: the system's own function */
+	f->real_base = nullptr;
+	f->slot = nullptr;
+	f->checked = false;
+	return f->target;
+}
+
 static HRESULT STDMETHODCALLTYPE hook_present_vt_front(IDXGISwapChain *swap, UINT sync_interval, UINT flags)
 {
 	const bool took = dxgi_capture_in_front(swap, flags);
-	if (took)
+	if (took) {
+		dxgi_front_checks_in_front(swap);
 		++captured_in_front;
-	const HRESULT hr = ((present_t)vt_present.real)(swap, sync_interval, flags);
+	}
+	const HRESULT hr = ((present_t)vtable_front_next(&vt_present))(swap, sync_interval, flags);
 	if (took)
 		--captured_in_front;
 	return hr;
@@ -220,9 +284,11 @@ static HRESULT STDMETHODCALLTYPE hook_present1_vt_front(IDXGISwapChain1 *swap, U
 							const DXGI_PRESENT_PARAMETERS *params)
 {
 	const bool took = dxgi_capture_in_front(swap, flags);
-	if (took)
+	if (took) {
+		dxgi_front_checks_in_front(swap);
 		++captured_in_front;
-	const HRESULT hr = ((present1_t)vt_present1.real)(swap, sync_interval, flags, params);
+	}
+	const HRESULT hr = ((present1_t)vtable_front_next(&vt_present1))(swap, sync_interval, flags, params);
 	if (took)
 		--captured_in_front;
 	return hr;
@@ -514,8 +580,10 @@ static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_
 static HRESULT STDMETHODCALLTYPE hook_present_front(IDXGISwapChain *swap, UINT sync_interval, UINT flags)
 {
 	const bool took = dxgi_capture_in_front(swap, flags);
-	if (took)
+	if (took) {
+		dxgi_front_checks_in_front(swap);
 		++captured_in_front;
+	}
 	const HRESULT hr = ((present_t)present_front.real)(swap, sync_interval, flags);
 	if (took)
 		--captured_in_front;
@@ -526,8 +594,10 @@ static HRESULT STDMETHODCALLTYPE hook_present1_front(IDXGISwapChain1 *swap, UINT
 						     const DXGI_PRESENT_PARAMETERS *params)
 {
 	const bool took = dxgi_capture_in_front(swap, flags);
-	if (took)
+	if (took) {
+		dxgi_front_checks_in_front(swap);
 		++captured_in_front;
+	}
 	const HRESULT hr = ((present1_t)present1_front.real)(swap, sync_interval, flags, params);
 	if (took)
 		--captured_in_front;

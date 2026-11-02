@@ -37,6 +37,10 @@ static inline HMODULE get_system_module(const char *module);
 static inline HMODULE load_system_library(const char *module);
 extern uint64_t os_gettime_ns(void);
 extern uint64_t capture_init_retry_ns;
+extern uint32_t capture_ring_cap;
+extern uint32_t capture_ring_good;
+extern uint32_t capture_ring_failed_slot;
+extern uint32_t capture_init_failures;
 
 #define flog(format, ...) hlog("%s: " format, __FUNCTION__, ##__VA_ARGS__)
 #define flog_hr(text, hr) hlog_hr(__FUNCTION__ ": " text, hr)
@@ -306,15 +310,69 @@ static inline bool capture_ring_resize_wanted(const struct shtex_data *shtex)
 	return shtex && capture_active() && shtex->ring_size != capture_ring_size_wanted();
 }
 
-/* Frame-locked capture: after a failed capture init (video memory ran out for
- * the ring while the game rebuilt its swap chain on an alt-tab) wait half a
- * second before the next attempt instead of trying again at every present;
- * each attempt creates and destroys a device and the slots made so far. */
-#define CAPTURE_INIT_RETRY_NS 500000000ULL
-static inline void capture_init_failed(void)
+/* Frame-locked capture: a ring that does not fit.  When a slot after the
+ * first one cannot be created (video memory or the system commit limit ran
+ * out), the ring size is what failed, and trying the same size again at
+ * every attempt keeps the capture down for as long as the shortage lasts
+ * (frozen picture on D3D, no capture at all on Vulkan).  The capture path
+ * notes the slot here; capture_init_failed() then lowers capture_ring_cap,
+ * which capture_ring_size_wanted() applies on top of what OBS asks for:
+ * - right away to the size that last worked, when a larger one was asked
+ *   for (the ring was growing);
+ * - otherwise after CAPTURE_RING_TRIES failed attempts in a row (a shortage
+ *   at an alt-tab often passes within a second) to half the size, at most
+ *   the slots that were made.
+ * The cap holds until the game exits and is published in hook_info, so OBS
+ * stops asking for more.  A failure at the first slot or outside the slots
+ * says nothing about the size and keeps the stock handling. */
+static inline void capture_ring_slot_failed(uint32_t slot)
 {
+	capture_ring_failed_slot = slot;
+}
+
+/* Frame-locked capture: after a failed capture init wait half a second before
+ * the next attempt instead of trying again at every present; each attempt
+ * creates and destroys a device and the slots made so far.  ring_tried is the
+ * ring size of the failed attempt (0 for a memory capture). */
+#define CAPTURE_INIT_RETRY_NS 500000000ULL
+#define CAPTURE_RING_TRIES 3
+static inline void capture_init_failed(uint32_t ring_tried)
+{
+	const uint32_t made = capture_ring_failed_slot;
+	uint32_t cap = 0;
+
+	capture_ring_failed_slot = 0;
 	capture_init_retry_ns = os_gettime_ns() + CAPTURE_INIT_RETRY_NS;
-	hlog("capture init failed; trying again in 0.5 s");
+
+	if (ring_tried <= 1 || made == 0 || made >= ring_tried) {
+		hlog("capture init failed; trying again in 0.5 s");
+		return;
+	}
+
+	capture_init_failures++;
+	if (capture_ring_good > 1 && capture_ring_good < ring_tried) {
+		cap = capture_ring_good;
+	} else if (capture_init_failures >= CAPTURE_RING_TRIES) {
+		cap = ring_tried / 2;
+		if (cap > made) {
+			cap = made;
+		}
+	}
+
+	if (!cap) {
+		hlog("capture init failed: %u of %u ring slots could be created; trying again in 0.5 s", made,
+		     ring_tried);
+		return;
+	}
+
+	capture_ring_cap = cap;
+	capture_init_failures = 0;
+	if (global_hook_info) {
+		global_hook_info->frame_ring_cap = cap;
+	}
+	hlog("capture init failed: %u of %u ring slots could be created; the ring is limited to %u slots in this "
+	     "game from now on; trying again in 0.5 s",
+	     made, ring_tried, cap);
 }
 
 #if COMPILE_VULKAN_HOOK
@@ -349,6 +407,8 @@ extern __declspec(thread) int captured_in_front;
 extern const void *hook_follow_jumps(const void *fn);
 extern const char *hook_module_name(const void *addr, char *buf, size_t size);
 extern const char *hook_module_path(const void *addr, char *buf, size_t size);
+/* a wide path as UTF-8 for a log line, cut to fit buf (always terminated) */
+extern const char *hook_wide_to_utf8(const wchar_t *src, char *buf, size_t size);
 extern void hook_in_front_install(struct hook_in_front *h);
 
 static inline bool should_passthrough()
