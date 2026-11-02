@@ -1196,10 +1196,10 @@ static uint64_t lock_delay(struct game_capture *gc)
 	if (gc->ring.size >= RING_MARGIN) {
 		const double fit = (double)(gc->ring.size - RING_MARGIN) * gc->lock.period_ns;
 		if ((double)delay_ns > fit) {
-			const bool small = (double)delay_ns <= fit + RING_FIT_SLACK * gc->lock.period_ns;
+			const bool within_slack = (double)delay_ns <= fit + RING_FIT_SLACK * gc->lock.period_ns;
 
 			delay_ns = (uint64_t)fit;
-			if (!small && !gc->lock.ring_short_logged) {
+			if (!within_slack && !gc->lock.ring_short_logged) {
 				gc->lock.ring_short_logged = true;
 				info("frame lock: the ring of %" PRIu32 " cannot hold the buffer delay at %.1f fps; video "
 				     "delay %.1f ms instead of %.1f ms for this game (the ring grows if the rate holds; else raise the ring limit)",
