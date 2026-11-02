@@ -152,6 +152,75 @@ static bool files_identical(const wchar_t *a, const wchar_t *b)
 	return same;
 }
 
+/* Frame-locked build: copy src over dst when a program holds dst loaded.  Any
+ * program that starts the Vulkan loader (a game, but also a background tool
+ * such as Ollama) loads the %ProgramData% hook as the implicit layer, and a
+ * loaded DLL cannot be overwritten (error 32).  It can be renamed, though: the
+ * program keeps running on the renamed file and every process started after
+ * this loads the new one.  Renamed copies are deleted at a later start, once
+ * nothing holds them (remove_old_hook_files). */
+static bool copy_over_busy_file(const wchar_t *src, const wchar_t *dst)
+{
+	wchar_t old[MAX_PATH];
+	DWORD err;
+
+	if (CopyFileW(src, dst, false)) {
+		return true;
+	}
+	err = GetLastError();
+	if (err != ERROR_SHARING_VIOLATION && err != ERROR_USER_MAPPED_FILE) {
+		SetLastError(err);
+		return false;
+	}
+	if (FAILED(StringCbPrintfW(old, sizeof(old), L"%s.old-%llu", dst, (unsigned long long)GetTickCount64())) ||
+	    !MoveFileExW(dst, old, 0)) {
+		SetLastError(err);
+		return false;
+	}
+	if (!CopyFileW(src, dst, false)) {
+		const DWORD err2 = GetLastError();
+		MoveFileExW(old, dst, 0); /* put the old one back */
+		SetLastError(err2);
+		return false;
+	}
+	blog(LOG_INFO,
+	     "frame-lock: %ls was held open by a running program (%lu); moved it aside to %ls and installed this "
+	     "build's hook (programs already running keep the old one until they restart)",
+	     dst, err, old);
+	return true;
+}
+
+/* delete hook copies copy_over_busy_file moved aside, where nothing holds them any more */
+static void remove_old_hook_files(const wchar_t *dst)
+{
+	wchar_t pattern[MAX_PATH];
+	wchar_t dir[MAX_PATH];
+	wchar_t path[MAX_PATH];
+	WIN32_FIND_DATAW wfd;
+	HANDLE h;
+	const wchar_t *slash;
+
+	if (FAILED(StringCbPrintfW(pattern, sizeof(pattern), L"%s.old-*", dst))) {
+		return;
+	}
+	slash = wcsrchr(dst, L'\\');
+	if (!slash || (size_t)(slash - dst + 1) >= MAX_PATH) {
+		return;
+	}
+	wcsncpy_s(dir, MAX_PATH, dst, (size_t)(slash - dst + 1));
+
+	h = FindFirstFileW(pattern, &wfd);
+	if (h == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	do {
+		if (SUCCEEDED(StringCbPrintfW(path, sizeof(path), L"%s%s", dir, wfd.cFileName))) {
+			DeleteFileW(path); /* fails while a program still holds it: next time */
+		}
+	} while (FindNextFileW(h, &wfd));
+	FindClose(h);
+}
+
 static LSTATUS get_reg(HKEY hkey, LPCWSTR sub_key, LPCWSTR value_name, bool b64)
 {
 	HKEY key;
@@ -301,6 +370,8 @@ static bool update_hook_file(bool b64, struct hook_stamp *stamp)
 		warn("source obs-vulkan%d.json missing", b64 ? 64 : 32);
 		return false;
 	}
+	remove_old_hook_files(dst);
+
 	if (!file_exists(dst) || !file_exists(dst_json)) {
 		if (!CreateDirectoryW(temp, NULL)) {
 			DWORD err = GetLastError();
@@ -345,7 +416,7 @@ static bool update_hook_file(bool b64, struct hook_stamp *stamp)
 			warn("failed to update %ls (%lu)", dst_json, GetLastError());
 			return false;
 		}
-		if (!CopyFileW(src, dst, false)) {
+		if (!copy_over_busy_file(src, dst)) {
 			warn("failed to update %ls (%lu)", dst, GetLastError());
 			return false;
 		}
@@ -372,7 +443,7 @@ static bool update_hook_file(bool b64, struct hook_stamp *stamp)
 	 * stock version, so the stock hook (no frame ring, no present log) kept
 	 * being loaded.  Keep the copy identical to ours instead. */
 	if (!files_identical(src, dst) || !files_identical(src_json, dst_json)) {
-		if (!CopyFileW(src_json, dst_json, false) || !CopyFileW(src, dst, false)) {
+		if (!CopyFileW(src_json, dst_json, false) || !copy_over_busy_file(src, dst)) {
 			warn("frame-lock: could not update %ls to this build's hook (%lu); a running Vulkan or "
 			     "OpenGL program may hold it open: close them and restart OBS, or Vulkan/OpenGL games "
 			     "will load the old hook without the present log",

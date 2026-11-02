@@ -139,6 +139,11 @@ struct game_capture_config {
  * margin for a present that comes early, the slot the hook writes next and the
  * slot OBS shows, which the hook steps over (capture_next_slot) */
 #define RING_MARGIN 4
+/* frames of the delay a ring may fall short by without growing: a game a hair
+ * faster than the output (60.02 fps on 60) needs 2.0005 frames for a 2-frame
+ * delay, and a ring restart in the middle of a recording for 0.01 ms of delay
+ * costs a held picture; the delay is shortened by that much instead */
+#define RING_FIT_SLACK 0.1
 #define LOCK_MAX_DELAY (FRAME_RING_MAX - RING_MARGIN)
 #define LOCK_HYSTERESIS 0.1     /* frames; a repeat or skip needs the timeline this far past the edge */
 #define LOCK_MAX_COUNTER_GAP 16 /* presents missing in a row: the game paused, refit from scratch */
@@ -1191,8 +1196,10 @@ static uint64_t lock_delay(struct game_capture *gc)
 	if (gc->ring.size >= RING_MARGIN) {
 		const double fit = (double)(gc->ring.size - RING_MARGIN) * gc->lock.period_ns;
 		if ((double)delay_ns > fit) {
+			const bool small = (double)delay_ns <= fit + RING_FIT_SLACK * gc->lock.period_ns;
+
 			delay_ns = (uint64_t)fit;
-			if (!gc->lock.ring_short_logged) {
+			if (!small && !gc->lock.ring_short_logged) {
 				gc->lock.ring_short_logged = true;
 				info("frame lock: the ring of %" PRIu32 " cannot hold the buffer delay at %.1f fps; video "
 				     "delay %.1f ms instead of %.1f ms for this game (the ring grows if the rate holds; else raise the ring limit)",
@@ -1533,7 +1540,9 @@ static void ring_grow_check(struct game_capture *gc)
 		 * presents takes a slot, so the rate counts however high it is:
 		 * 6x frame generation at 84 fps = 504 presents/s = 17 + 4 slots */
 		const double delay_ns = (double)gc->config.buffer_delay * interval;
-		needed = (uint32_t)ceil(delay_ns / gc->lock.period_ns) + RING_MARGIN;
+		const double frames = delay_ns / gc->lock.period_ns - RING_FIT_SLACK;
+
+		needed = (uint32_t)ceil(frames > 0.0 ? frames : 0.0) + RING_MARGIN;
 		why = gc->lock.burst ? "frame-generation bursts" : "present rate";
 	}
 	if (gc->lock.burst) {
@@ -2105,6 +2114,13 @@ static void flog_tick(struct game_capture *gc)
 	char lockcols[64];
 
 	if (!enabled) {
+		if (gc->flog.file && gc->config.frame_log && gc->capturing && !gc->shtex_data) {
+			/* between two captures of a restart: OBS let go of the old
+			 * shared block and maps the new one at the hook's next ready
+			 * signal; the log goes on there (reopening it would start the
+			 * file over, losing what the recording logged so far) */
+			return;
+		}
 		if (gc->flog.file)
 			flog_close(gc, "capture stopped");
 
