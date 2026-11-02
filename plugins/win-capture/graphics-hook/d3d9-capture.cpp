@@ -32,13 +32,14 @@ struct d3d9_data {
 	DXGI_FORMAT dxgi_format;
 	bool using_shtex;
 
-	/* shared texture */
-	IDirect3DSurface9 *d3d9_copytex;
+	/* shared texture(s): frame-locked capture uses a ring of ring_size slots */
+	IDirect3DSurface9 *d3d9_copytex[FRAME_RING_MAX];
 	ID3D11Device *d3d11_device;
 	ID3D11DeviceContext *d3d11_context;
-	ID3D11Resource *d3d11_tex;
+	ID3D11Resource *d3d11_tex[FRAME_RING_MAX];
 	struct shtex_data *shtex_info;
-	HANDLE handle;
+	HANDLE handle[FRAME_RING_MAX];
+	uint32_t ring_size;
 	int patch;
 
 	/* shared memory */
@@ -59,17 +60,19 @@ static void d3d9_free()
 	capture_free();
 
 	if (data.using_shtex) {
-		if (data.d3d11_tex) {
-			data.d3d11_tex->Release();
+		for (uint32_t i = 0; i < FRAME_RING_MAX; i++) {
+			if (data.d3d11_tex[i]) {
+				data.d3d11_tex[i]->Release();
+			}
+			if (data.d3d9_copytex[i]) {
+				data.d3d9_copytex[i]->Release();
+			}
 		}
 		if (data.d3d11_context) {
 			data.d3d11_context->Release();
 		}
 		if (data.d3d11_device) {
 			data.d3d11_device->Release();
-		}
-		if (data.d3d9_copytex) {
-			data.d3d9_copytex->Release();
 		}
 	} else {
 		for (size_t i = 0; i < NUM_BUFFERS; i++) {
@@ -188,24 +191,26 @@ static inline bool d3d9_shtex_init_shtex()
 	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 	desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
-	hr = data.d3d11_device->CreateTexture2D(&desc, nullptr, (ID3D11Texture2D **)&data.d3d11_tex);
-	if (FAILED(hr)) {
-		hlog_hr("d3d9_shtex_init_shtex: Failed to create D3D11 texture", hr);
-		return false;
-	}
+	for (uint32_t i = 0; i < data.ring_size; i++) {
+		hr = data.d3d11_device->CreateTexture2D(&desc, nullptr, (ID3D11Texture2D **)&data.d3d11_tex[i]);
+		if (FAILED(hr)) {
+			hlog_hr("d3d9_shtex_init_shtex: Failed to create D3D11 texture", hr);
+			return false;
+		}
 
-	hr = data.d3d11_tex->QueryInterface(__uuidof(IDXGIResource), (void **)&res);
-	if (FAILED(hr)) {
-		hlog_hr("d3d9_shtex_init_shtex: Failed to query IDXGIResource", hr);
-		return false;
-	}
+		hr = data.d3d11_tex[i]->QueryInterface(__uuidof(IDXGIResource), (void **)&res);
+		if (FAILED(hr)) {
+			hlog_hr("d3d9_shtex_init_shtex: Failed to query IDXGIResource", hr);
+			return false;
+		}
 
-	hr = res->GetSharedHandle(&data.handle);
-	res->Release();
+		hr = res->GetSharedHandle(&data.handle[i]);
+		res->Release();
 
-	if (FAILED(hr)) {
-		hlog_hr("d3d9_shtex_init_shtex: Failed to get shared handle", hr);
-		return false;
+		if (FAILED(hr)) {
+			hlog_hr("d3d9_shtex_init_shtex: Failed to get shared handle", hr);
+			return false;
+		}
 	}
 
 	return true;
@@ -242,8 +247,21 @@ static inline bool d3d9_shtex_init_copytex()
 		memcpy(patch_addr, patch[data.patch].data, patch_size);
 	}
 
-	hr = data.device->CreateTexture(data.cx, data.cy, 1, D3DUSAGE_RENDERTARGET, data.d3d9_format, D3DPOOL_DEFAULT,
-					&tex, &data.handle);
+	/* frame-locked capture: open every ring slot as a D3D9 texture (one
+	 * StretchRect target per slot) while the device is patched to D3D9Ex */
+	hr = S_OK;
+	for (uint32_t i = 0; i < data.ring_size && SUCCEEDED(hr); i++) {
+		hr = data.device->CreateTexture(data.cx, data.cy, 1, D3DUSAGE_RENDERTARGET, data.d3d9_format,
+						D3DPOOL_DEFAULT, &tex, &data.handle[i]);
+		if (SUCCEEDED(hr)) {
+			hr = tex->GetSurfaceLevel(0, &data.d3d9_copytex[i]);
+			tex->Release();
+			if (FAILED(hr))
+				hlog_hr("d3d9_shtex_init_copytex: Failed to get surface level", hr);
+		} else {
+			hlog_hr("d3d9_shtex_init_copytex: Failed to create shared texture", hr);
+		}
+	}
 
 	if (p_is_d3d9) {
 		*p_is_d3d9 = was_d3d9ex;
@@ -253,25 +271,15 @@ static inline bool d3d9_shtex_init_copytex()
 		VirtualProtect(patch_addr, patch_size, protect_val, &protect_val);
 	}
 
-	if (FAILED(hr)) {
-		hlog_hr("d3d9_shtex_init_copytex: Failed to create shared texture", hr);
-		return false;
-	}
-
-	hr = tex->GetSurfaceLevel(0, &data.d3d9_copytex);
-	tex->Release();
-
-	if (FAILED(hr)) {
-		hlog_hr("d3d9_shtex_init_copytex: Failed to get surface level", hr);
-		return false;
-	}
-
-	return true;
+	return SUCCEEDED(hr);
 }
 
 static bool d3d9_shtex_init(HWND window)
 {
+	uintptr_t handles[FRAME_RING_MAX];
+
 	data.using_shtex = true;
+	data.ring_size = capture_ring_size_wanted();
 
 	if (!shex_init_d3d11()) {
 		return false;
@@ -282,12 +290,14 @@ static bool d3d9_shtex_init(HWND window)
 	if (!d3d9_shtex_init_copytex()) {
 		return false;
 	}
-	if (!capture_init_shtex(&data.shtex_info, window, data.cx, data.cy, data.dxgi_format, false,
-				(uintptr_t)data.handle)) {
+	for (uint32_t i = 0; i < data.ring_size; i++)
+		handles[i] = (uintptr_t)data.handle[i];
+	if (!capture_init_shtex_ring(&data.shtex_info, window, data.cx, data.cy, data.dxgi_format, false, handles,
+				     data.ring_size)) {
 		return false;
 	}
 
-	hlog("d3d9 shared texture capture successful");
+	hlog("d3d9 shared texture capture successful (%u slot%s)", data.ring_size, data.ring_size == 1 ? "" : "s");
 	return true;
 }
 
@@ -482,10 +492,15 @@ static inline void d3d9_shtex_capture(IDirect3DSurface9 *backbuffer)
 {
 	HRESULT hr;
 
-	hr = data.device->StretchRect(backbuffer, nullptr, data.d3d9_copytex, nullptr, D3DTEXF_NONE);
+	const uint32_t slot = capture_next_slot(data.shtex_info);
+
+	hr = data.device->StretchRect(backbuffer, nullptr, data.d3d9_copytex[slot], nullptr, D3DTEXF_NONE);
 	if (FAILED(hr)) {
 		hlog_hr("d3d9_shtex_capture: StretchRect failed", hr);
+		return;
 	}
+
+	capture_log_present(data.shtex_info, slot);
 }
 
 static void d3d9_shmem_capture_copy(int i)
@@ -546,13 +561,13 @@ static inline void d3d9_shmem_capture(IDirect3DSurface9 *backbuffer)
 
 static void d3d9_capture(IDirect3DDevice9 *device, IDirect3DSurface9 *backbuffer)
 {
-	if (capture_should_stop()) {
+	if (capture_should_stop() || capture_ring_resize_wanted(data.shtex_info)) {
 		d3d9_free();
 	}
 	if (capture_should_init()) {
 		d3d9_init(device);
 	}
-	if (data.handle != nullptr && capture_ready()) {
+	if (data.handle[0] != nullptr && capture_ready()) {
 		if (data.device != device) {
 			d3d9_free();
 			return;
@@ -569,6 +584,24 @@ static void d3d9_capture(IDirect3DDevice9 *device, IDirect3DSurface9 *backbuffer
 /* this is used just in case Present calls PresentEx or vise versa. */
 static int present_recurse = 0;
 
+static struct hook_in_front present_front = {};
+static struct hook_in_front present_ex_front = {};
+static struct hook_in_front present_swap_front = {};
+static bool front_checked_active = false;
+
+/* at every present the capture copied: (re)check who is in front of our
+ * hooks when a capture has just started (see graphics-hook.h) */
+static inline void d3d9_front_check(void)
+{
+	const bool now = capture_active();
+	if (now && !front_checked_active) {
+		hook_in_front_install(&present_front);
+		hook_in_front_install(&present_ex_front);
+		hook_in_front_install(&present_swap_front);
+	}
+	front_checked_active = now;
+}
+
 static inline void present_begin(IDirect3DDevice9 *device, IDirect3DSurface9 *&backbuffer)
 {
 	HRESULT hr;
@@ -581,12 +614,38 @@ static inline void present_begin(IDirect3DDevice9 *device, IDirect3DSurface9 *&b
 				hr);
 		}
 
-		if (!global_hook_info->capture_overlay) {
+		if (!global_hook_info->capture_overlay && captured_in_front == 0) {
 			d3d9_capture(device, backbuffer);
+			d3d9_front_check();
 		}
 	}
 
 	present_recurse++;
+}
+
+/* the copy for a present whose hook we got in front of; the back buffer is
+ * released by present_front_end after the present */
+static inline bool present_front_begin(IDirect3DDevice9 *device, IDirect3DSurface9 *&backbuffer)
+{
+	if (captured_in_front != 0 || present_recurse != 0 || global_hook_info->capture_overlay)
+		return false;
+
+	const HRESULT hr = get_backbuffer(device, &backbuffer);
+	if (FAILED(hr)) {
+		hlog_hr("present_front_begin: Failed to get backbuffer", hr);
+	}
+
+	d3d9_capture(device, backbuffer);
+	++captured_in_front;
+	return true;
+}
+
+static inline void present_front_end(bool took, IDirect3DSurface9 *backbuffer)
+{
+	if (took)
+		--captured_in_front;
+	if (backbuffer)
+		backbuffer->Release();
 }
 
 static inline void present_end(IDirect3DDevice9 *device, IDirect3DSurface9 *backbuffer)
@@ -623,6 +682,64 @@ static HRESULT STDMETHODCALLTYPE hook_present(IDirect3DDevice9 *device, CONST RE
 	const HRESULT hr = RealPresent(device, src_rect, dst_rect, override_window, dirty_region);
 
 	present_end(device, backbuffer);
+
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hook_present_front(IDirect3DDevice9 *device, CONST RECT *src_rect,
+						    CONST RECT *dst_rect, HWND override_window,
+						    CONST RGNDATA *dirty_region)
+{
+	IDirect3DSurface9 *backbuffer = nullptr;
+
+	const bool took = present_front_begin(device, backbuffer);
+	const HRESULT hr =
+		((present_t)present_front.real)(device, src_rect, dst_rect, override_window, dirty_region);
+	present_front_end(took, backbuffer);
+
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hook_present_ex_front(IDirect3DDevice9Ex *device, CONST RECT *src_rect,
+						       CONST RECT *dst_rect, HWND override_window,
+						       CONST RGNDATA *dirty_region, DWORD flags)
+{
+	IDirect3DSurface9 *backbuffer = nullptr;
+
+	const bool took = present_front_begin(device, backbuffer);
+	const HRESULT hr = ((present_ex_t)present_ex_front.real)(device, src_rect, dst_rect, override_window,
+								 dirty_region, flags);
+	present_front_end(took, backbuffer);
+
+	return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hook_present_swap_front(IDirect3DSwapChain9 *swap, CONST RECT *src_rect,
+							 CONST RECT *dst_rect, HWND override_window,
+							 CONST RGNDATA *dirty_region, DWORD flags)
+{
+	IDirect3DSurface9 *backbuffer = nullptr;
+	IDirect3DDevice9 *device = nullptr;
+	bool took = false;
+
+	if (captured_in_front == 0 && present_recurse == 0 && !global_hook_info->capture_overlay) {
+		IDirect3DDevice9 *temp;
+		if (SUCCEEDED(swap->GetDevice(&temp))) {
+			device = temp;
+		}
+	}
+
+	if (device) {
+		took = present_front_begin(device, backbuffer);
+	}
+
+	const HRESULT hr = ((present_swap_t)present_swap_front.real)(swap, src_rect, dst_rect, override_window,
+								     dirty_region, flags);
+
+	if (device) {
+		present_front_end(took, backbuffer);
+		device->Release();
+	}
 
 	return hr;
 }
@@ -845,6 +962,25 @@ bool hook_d3d9(void)
 	const LONG error = DetourTransactionCommit();
 	const bool success = error == NO_ERROR;
 	if (success) {
+		if (present_swap_addr) {
+			present_swap_front.target = present_swap_addr;
+			present_swap_front.inner = (void *)hook_present_swap;
+			present_swap_front.outer = (void *)hook_present_swap_front;
+			present_swap_front.name = "IDirect3DSwapChain9::Present";
+		}
+		if (present_ex_addr) {
+			present_ex_front.target = present_ex_addr;
+			present_ex_front.inner = (void *)hook_present_ex;
+			present_ex_front.outer = (void *)hook_present_ex_front;
+			present_ex_front.name = "IDirect3DDevice9Ex::PresentEx";
+		}
+		if (present_addr) {
+			present_front.target = present_addr;
+			present_front.inner = (void *)hook_present;
+			present_front.outer = (void *)hook_present_front;
+			present_front.name = "IDirect3DDevice9::Present";
+		}
+
 		if (RealPresentSwap) {
 			hlog("Hooked IDirect3DSwapChain9::Present");
 		}

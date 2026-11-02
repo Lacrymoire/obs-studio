@@ -1,6 +1,9 @@
 #include <windows.h>
 #include <psapi.h>
 #include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+#include <detours.h>
 #include "graphics-hook.h"
 #ifdef OBS_LEGACY
 #include "../graphics-hook-ver.h"
@@ -57,6 +60,7 @@ static HANDLE shmem_file_handle = 0;
 static struct thread_data thread_data = {0};
 
 volatile bool active = false;
+uint64_t capture_init_retry_ns = 0; /* frame-locked capture: see capture_init_failed */
 struct hook_info *global_hook_info = NULL;
 
 static inline void wait_for_dll_main_finish(HANDLE thread_handle)
@@ -539,16 +543,50 @@ static inline bool init_shared_info(size_t size, HWND window)
 	return true;
 }
 
+uint32_t capture_ring_next_slot = 0;
+
+uint32_t capture_ring_size_wanted(void)
+{
+	uint32_t n = global_hook_info ? global_hook_info->frame_ring_size : 1;
+
+	if (n < 1)
+		n = 1;
+	if (n > FRAME_RING_MAX)
+		n = FRAME_RING_MAX;
+	return n;
+}
+
 bool capture_init_shtex(struct shtex_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t format, bool flip,
 			uintptr_t handle)
 {
+	return capture_init_shtex_ring(data, window, cx, cy, format, flip, &handle, 1);
+}
+
+bool capture_init_shtex_ring(struct shtex_data **data, HWND window, uint32_t cx, uint32_t cy, uint32_t format,
+			     bool flip, const uintptr_t *handles, uint32_t count)
+{
+	if (count < 1 || count > FRAME_RING_MAX) {
+		hlog("capture_init_shtex: invalid ring size %u", count);
+		return false;
+	}
+
 	if (!init_shared_info(sizeof(struct shtex_data), window)) {
 		hlog("capture_init_shtex: Failed to initialize memory");
 		return false;
 	}
 
 	*data = shmem_info;
-	(*data)->tex_handle = (uint32_t)handle;
+	(*data)->tex_handle = (uint32_t)handles[0];
+	(*data)->log_version = SHTEX_LOG_VERSION;
+	(*data)->present_count = 0;
+	(*data)->ring_size = count;
+	(*data)->read_slot = FRAME_RING_NONE;
+	(*data)->conflicts = 0;
+	for (uint32_t i = 0; i < count; i++)
+		(*data)->tex_handles[i] = (uint32_t)handles[i];
+	capture_ring_next_slot = 0;
+	hlog("frame-lock present log v%d ready (%d records, ring of %u slot%s)", (int)SHTEX_LOG_VERSION,
+	     (int)PRESENT_LOG_SIZE, count, count == 1 ? "" : "s");
 
 	global_hook_info->hook_ver_major = HOOK_VER_MAJOR;
 	global_hook_info->hook_ver_minor = HOOK_VER_MINOR;
@@ -823,6 +861,133 @@ static bool init_dll(void)
 
 	dup_hook_mutex = create_mutex_plus_id(HOOK_NAME, pid);
 	return !!dup_hook_mutex;
+}
+
+/* ------------------------------------------------------------------------- */
+/* hooking in front of another hook (see graphics-hook.h)                    */
+
+__declspec(thread) int captured_in_front = 0;
+
+static bool code_readable(const void *p, size_t n)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+	    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+		return false;
+	return (const uint8_t *)p + n <= (const uint8_t *)mbi.BaseAddress + mbi.RegionSize;
+}
+
+/* the first instruction of a function somebody detoured is a jump (RTSS
+ * patches entry points this way, Detours too, sometimes through a near
+ * stub, and an incremental link reaches functions through jump thunks) */
+static const void *jump_target(const uint8_t *p)
+{
+	if (!code_readable(p, 12))
+		return NULL;
+	if (p[0] == 0xE9) /* jmp rel32 */
+		return p + 5 + *(const int32_t *)(p + 1);
+	if (p[0] == 0xFF && p[1] == 0x25) { /* jmp [mem] */
+#ifdef _WIN64
+		const void *const *slot = (const void *const *)(p + 6 + *(const int32_t *)(p + 2));
+#else
+		const void *const *slot = (const void *const *)(uintptr_t)(*(const uint32_t *)(p + 2));
+#endif
+		return code_readable(slot, sizeof(*slot)) ? *slot : NULL;
+	}
+	if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) /* mov rax, imm64; jmp rax */
+		return *(const void *const *)(p + 2);
+	if (p[0] == 0x68 && p[5] == 0xC3) /* push imm32; ret */
+		return (const void *)(uintptr_t)(*(const uint32_t *)(p + 1));
+	return NULL;
+}
+
+/* follow entry jumps to where the code really goes */
+const void *hook_follow_jumps(const void *fn)
+{
+	const void *cur = fn;
+	for (int hops = 0; hops < 4 && cur; hops++) {
+		const void *next = jump_target(cur);
+		if (!next)
+			break;
+		cur = next;
+	}
+	return cur ? cur : fn;
+}
+
+const char *hook_module_name(const void *addr, char *buf, size_t size)
+{
+	HMODULE mod = NULL;
+	wchar_t path[MAX_PATH];
+
+	if (addr &&
+	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCWSTR)addr, &mod) &&
+	    GetModuleFileNameW(mod, path, MAX_PATH)) {
+		const wchar_t *base = wcsrchr(path, L'\\');
+		snprintf(buf, size, "%ls", base ? base + 1 : path);
+	} else {
+		snprintf(buf, size, "an unknown module");
+	}
+	return buf;
+}
+
+/* the same with the full path: a d3d12.dll in front of our hook is one
+ * thing when it is the system's, another when it is a proxy in the game's
+ * folder (ReShade, a mod loader) */
+const char *hook_module_path(const void *addr, char *buf, size_t size)
+{
+	HMODULE mod = NULL;
+	wchar_t path[MAX_PATH];
+
+	if (addr &&
+	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCWSTR)addr, &mod) &&
+	    GetModuleFileNameW(mod, path, MAX_PATH)) {
+		snprintf(buf, size, "%ls", path);
+	} else {
+		snprintf(buf, size, "an unknown module");
+	}
+	return buf;
+}
+
+void hook_in_front_install(struct hook_in_front *h)
+{
+	char m[64];
+
+	if (!h->target || !h->inner || !h->outer || h->failed)
+		return;
+
+	const void *first = hook_follow_jumps(h->target);
+	if (first == hook_follow_jumps(h->inner)) {
+		if (!h->checked)
+			hlog("frame-lock: %s: our hook is first in line, nothing draws in front of it", h->name);
+		h->checked = true;
+		return;
+	}
+	if (h->real) {
+		if (first != hook_follow_jumps(h->outer))
+			hlog("frame-lock: %s: %s hooked in front of us again after the capture started; its overlay "
+			     "stays in the capture until the game restarts",
+			     h->name, hook_module_name(first, m, sizeof(m)));
+		return;
+	}
+
+	hlog("frame-lock: %s: %s runs before our hook; hooking in front of it", h->name,
+	     hook_module_name(first, m, sizeof(m)));
+
+	h->real = h->target;
+	DetourTransactionBegin();
+	DetourAttach(&h->real, h->outer);
+	const LONG error = DetourTransactionCommit();
+	if (error != NO_ERROR) {
+		hlog("frame-lock: %s: could not hook in front (%ld); overlays drawn there stay in the capture", h->name,
+		     error);
+		h->real = NULL;
+		h->failed = true;
+		return;
+	}
+	hlog("frame-lock: %s: hooked in front; third-party overlays drawn there are left out of the capture",
+	     h->name);
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID unused1)

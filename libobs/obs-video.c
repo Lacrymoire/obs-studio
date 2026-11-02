@@ -809,6 +809,29 @@ static inline void video_sleep(struct obs_core_video *video, uint64_t *p_time, u
 	uint64_t t = cur_time + interval_ns;
 	int count;
 
+	/* game-clock output: the clock-master source may have asked for the next
+	 * tick at the time its next frame is due, within half to two nominal
+	 * intervals of this tick; a stalled game or no master keeps the nominal
+	 * interval.  The per-tick requests are consumed here and cleared. */
+	const bool game_clock = video->game_clock_enabled;
+	uint64_t frame_ts = 0;
+	bool skip = false;
+
+	if (game_clock) {
+		const uint64_t next = video->game_clock_next_tick;
+		if (next) {
+			const uint64_t lo = cur_time + interval_ns / 2;
+			const uint64_t hi = cur_time + interval_ns * 2;
+			t = next < lo ? lo : (next > hi ? hi : next);
+			video->game_clock_paced++;
+		}
+		frame_ts = video->game_clock_frame_ts;
+		skip = video->game_clock_skip;
+	}
+	video->game_clock_next_tick = 0;
+	video->game_clock_frame_ts = 0;
+	video->game_clock_skip = false;
+
 	if (os_sleepto_ns(t)) {
 		*p_time = t;
 		count = 1;
@@ -825,6 +848,18 @@ static inline void video_sleep(struct obs_core_video *video, uint64_t *p_time, u
 	video->lagged_frames += count - 1;
 
 	vframe_info.timestamp = cur_time;
+	if (game_clock) {
+		/* the frame rendered this tick is stamped with the time it was
+		 * presented by the game (the master's smoothed clock) rather than
+		 * with the tick time; strictly increasing whatever the source does */
+		uint64_t ts = frame_ts ? frame_ts : cur_time;
+		if (ts <= video->game_clock_last_ts)
+			ts = video->game_clock_last_ts + interval_ns / 8;
+		video->game_clock_last_ts = ts;
+		vframe_info.timestamp = ts;
+		if (skip)
+			video->game_clock_skipped++;
+	}
 	vframe_info.count = count;
 
 	pthread_mutex_lock(&video->encoder_group_mutex);
@@ -852,9 +887,11 @@ static inline void video_sleep(struct obs_core_video *video, uint64_t *p_time, u
 		bool raw_active = video->raw_was_active;
 		bool gpu_active = video->gpu_was_active;
 
-		if (raw_active)
+		/* a skipped frame (game-clock repeat) is rendered but not queued:
+		 * the encoders then see no frame for this tick */
+		if (raw_active && !skip)
 			deque_push_back(&video->vframe_info_buffer, &vframe_info, sizeof(vframe_info));
-		if (gpu_active)
+		if (gpu_active && !skip)
 			deque_push_back(&video->vframe_info_buffer_gpu, &vframe_info, sizeof(vframe_info));
 	}
 	pthread_mutex_unlock(&obs->video.mixes_mutex);
@@ -899,7 +936,7 @@ static inline void output_frame(struct obs_core_video_mix *video)
 	gs_leave_context();
 	profile_end(output_frame_gs_context_name);
 
-	if (raw_active && frame_ready) {
+	if (raw_active && frame_ready && video->vframe_info_buffer.size) {
 		struct obs_vframe_info vframe_info;
 		deque_pop_front(&video->vframe_info_buffer, &vframe_info, sizeof(vframe_info));
 
@@ -1089,6 +1126,46 @@ static inline bool stop_requested(void)
 	pthread_mutex_unlock(&obs->video.mixes_mutex);
 
 	return success;
+}
+
+/* Frame-locked capture, game-clock output (Phase 5) */
+void obs_set_game_clock_enabled(bool enabled)
+{
+	if (!obs)
+		return;
+	if (obs->video.game_clock_enabled != enabled)
+		blog(LOG_INFO, "game-clock output %s", enabled ? "enabled" : "disabled");
+	obs->video.game_clock_enabled = enabled;
+	if (!enabled)
+		obs->video.game_clock_last_ts = 0;
+}
+
+bool obs_get_game_clock_enabled(void)
+{
+	return obs ? obs->video.game_clock_enabled : false;
+}
+
+void obs_set_game_clock_retime(bool retime)
+{
+	if (!obs)
+		return;
+	if (obs->video.game_clock_retime != retime)
+		blog(LOG_INFO, "game-clock output: retimed constant frame rate %s", retime ? "enabled" : "disabled");
+	obs->video.game_clock_retime = retime;
+}
+
+bool obs_get_game_clock_retime(void)
+{
+	return obs ? obs->video.game_clock_retime : false;
+}
+
+void obs_video_set_game_clock_tick(uint64_t frame_ts_ns, uint64_t next_tick_ns, bool skip)
+{
+	if (!obs || !obs->video.game_clock_enabled)
+		return;
+	obs->video.game_clock_frame_ts = frame_ts_ns;
+	obs->video.game_clock_next_tick = next_tick_ns;
+	obs->video.game_clock_skip = skip;
 }
 
 bool obs_graphics_thread_loop(struct obs_graphics_context *context)

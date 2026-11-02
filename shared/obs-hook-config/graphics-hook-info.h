@@ -72,8 +72,38 @@ struct shmem_data {
 	uint32_t tex2_offset;
 };
 
+/* Frame-locked capture.
+ *
+ * Phase 1: the hook records every frame it copied (counter and present time)
+ * in present_log, and OBS reads it once per video tick.
+ * Phase 2: instead of one shared texture the hook owns a ring of ring_size
+ * shared textures ("slots").  Every present is copied into the next free slot
+ * and its record says which slot holds it.  OBS tells the hook which slot it
+ * is showing in read_slot; the hook steps over that slot instead of writing
+ * it, so it never waits for OBS and OBS never shows a slot being written.
+ * Times are os_gettime_ns() values: QueryPerformanceCounter scaled to
+ * nanoseconds, the clock libobs uses for obs_get_video_frame_time(). */
+#define SHTEX_LOG_VERSION 4
+#define PRESENT_LOG_SIZE 256
+#define FRAME_RING_MAX 32 /* Phase 8: a frame-generated stream needs about 4 x its factor */
+#define FRAME_RING_NONE 0xFFFFFFFFu
+
+struct present_record {
+	uint64_t time_ns; /* when the hook copied the frame, just before the game's Present ran */
+	uint64_t counter; /* 1-based count of copied frames since capture init */
+	uint32_t slot;    /* ring slot that holds this frame (0 without a ring) */
+	uint32_t reserved;
+};
+
 struct shtex_data {
-	uint32_t tex_handle;
+	uint32_t tex_handle;             /* shared handle of slot 0 (the only texture without a ring) */
+	uint32_t log_version;            /* SHTEX_LOG_VERSION, so OBS can tell which layout it reads */
+	volatile uint64_t present_count; /* records written; record i is present_log[i % PRESENT_LOG_SIZE] */
+	uint32_t ring_size;              /* valid entries in tex_handles; 1 = no ring, stock behaviour */
+	volatile uint32_t read_slot;     /* written by OBS: slot it shows now, FRAME_RING_NONE = none */
+	volatile uint64_t conflicts;     /* hook: presents whose next slot was read_slot (stepped over it) */
+	uint32_t tex_handles[FRAME_RING_MAX];
+	struct present_record present_log[PRESENT_LOG_SIZE];
 };
 
 enum capture_type {
@@ -118,7 +148,10 @@ struct hook_info {
 	/* hook addresses */
 	struct graphics_offsets offsets;
 
-	uint32_t reserved[126];
+	/* frame-locked capture: slots the hook should allocate (1 = stock single texture) */
+	uint32_t frame_ring_size;
+
+	uint32_t reserved[125];
 };
 static_assert(sizeof(struct hook_info) == 648, "ABI compatibility");
 

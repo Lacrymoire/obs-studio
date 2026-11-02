@@ -94,7 +94,9 @@ static void *gpu_encode_thread(void *data)
 				struct obs_encoder_group *group = encoder->encoder_group;
 				bool ready = false;
 				pthread_mutex_lock(&group->mutex);
-				ready = group->start_timestamp == timestamp;
+				/* a bound, not an exact match (game-clock frames carry
+				 * their presentation time, not the tick time) */
+				ready = timestamp >= group->start_timestamp;
 				pthread_mutex_unlock(&group->mutex);
 				if (!ready)
 					continue;
@@ -151,6 +153,12 @@ static void *gpu_encode_thread(void *data)
 			 */
 			fer_ts = os_gettime_ns();
 
+			/* game-clock output: real-time pts from the frame timestamp;
+			 * the retime mark goes in before the encode, which may hand
+			 * this frame's packet back at once (no reordering delay) */
+			const int64_t pts = video_frame_pts(encoder, timestamp);
+			retime_mark_frame(encoder, timestamp, pts);
+
 			profile_start(gpu_encode_frame_name);
 			if (encoder->info.encode_texture2) {
 				struct encoder_texture tex = {0};
@@ -159,12 +167,11 @@ static void *gpu_encode_thread(void *data)
 				tex.tex[0] = tf.tex;
 				tex.tex[1] = tf.tex_uv;
 				tex.tex[2] = NULL;
-				success = encoder->info.encode_texture2(encoder->context.data, &tex, encoder->cur_pts,
-									lock_key, &next_key, &pkt, &received);
+				success = encoder->info.encode_texture2(encoder->context.data, &tex, pts, lock_key,
+									&next_key, &pkt, &received);
 			} else {
-				success = encoder->info.encode_texture(encoder->context.data, tf.handle,
-								       encoder->cur_pts, lock_key, &next_key, &pkt,
-								       &received);
+				success = encoder->info.encode_texture(encoder->context.data, tf.handle, pts,
+								       lock_key, &next_key, &pkt, &received);
 			}
 			profile_end(gpu_encode_frame_name);
 
@@ -182,7 +189,7 @@ static void *gpu_encode_thread(void *data)
 					ept->ferc = 0;
 				}
 
-				ept->pts = encoder->cur_pts;
+				ept->pts = pts;
 				ept->cts = tf.timestamp;
 				ept->fer = fer_ts;
 			}

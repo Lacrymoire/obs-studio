@@ -197,6 +197,14 @@ static void add_video_encoder_params(struct ffmpeg_muxer *stream, os_process_arg
 	os_process_args_add_argf(args, "%d", (int)info->fps_num);
 	os_process_args_add_argf(args, "%d", (int)info->fps_den);
 	os_process_args_add_argf(args, "%d", codec_tag);
+
+	/* frame-locked capture, game-clock output: the packet timebase of the
+	 * video encoder (1/(fps_num * 1000) when enabled), so that the muxer's
+	 * stream time base matches the pts it receives */
+	uint32_t tb_num = 0, tb_den = 0;
+	obs_encoder_get_timebase(vencoder, &tb_num, &tb_den);
+	os_process_args_add_argf(args, "%d", (int)tb_num);
+	os_process_args_add_argf(args, "%d", (int)tb_den);
 }
 
 static void add_audio_encoder_params(os_process_args_t *args, obs_encoder_t *aencoder)

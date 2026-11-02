@@ -51,6 +51,8 @@
 #define MICROSECOND_DEN 1000000
 #define NUM_ENCODE_TEXTURES 10
 #define NUM_ENCODE_TEXTURE_FRAMES_TO_WAIT 1
+#define RETIME_HIST 512 /* Phase 5b: video frames of (timestamp, pts) history, 8.5 s at 60 fps */
+#define RETIME_RATE_HIST 32 /* Phase 5b: one (time, video file time) sample per second for the rate */
 
 static inline int64_t packet_dts_usec(struct encoder_packet *packet)
 {
@@ -413,6 +415,19 @@ struct obs_core_video {
 	uint32_t total_frames;
 	uint32_t lagged_frames;
 	bool thread_initialized;
+
+	/* Frame-locked capture, game-clock output (Phase 5).  The clock-master
+	 * source sets the per-tick fields from its video_tick (video thread);
+	 * video_sleep consumes and clears them on the same thread. */
+	volatile bool game_clock_enabled; /* user setting: real-time pts, paced ticks */
+	volatile bool game_clock_retime;  /* user setting: paced ticks but frame-count pts (constant
+					   * frame rate) and the audio trimmed to follow (Phase 5b) */
+	uint64_t game_clock_frame_ts;     /* timestamp of the frame rendered this tick (0 = tick time) */
+	uint64_t game_clock_next_tick;    /* wall time the next tick should run at (0 = nominal) */
+	bool game_clock_skip;             /* this tick's frame is a repeat: do not encode it */
+	uint64_t game_clock_last_ts;      /* monotonic guard for the frame timestamps */
+	uint32_t game_clock_skipped;      /* frames not queued to the encoders */
+	uint32_t game_clock_paced;        /* ticks whose time the master source chose */
 
 	gs_texture_t *transparent_texture;
 
@@ -1423,6 +1438,44 @@ struct obs_encoder {
 	uint32_t roi_increment;
 
 	int64_t cur_pts;
+	/* frame-locked capture, game-clock output: latched when the video
+	 * timebase is set; pts then come from frame timestamps (see
+	 * video_frame_pts), cur_pts stays the frame counter */
+	bool game_clock;
+	/* video encoders in retimed mode (paced ticks, frame-count pts): the
+	 * packets' system dts come from the frame timestamps (marks) */
+	bool retime_video;
+	/* Phase 5b retimed CFR, audio encoders: the audio is passed through a
+	 * same-rate resampler whose rate is trimmed so that the audio sent to
+	 * the encoder follows the paired video encoder's file time (see
+	 * retime_audio) */
+	bool retime;
+	struct resample_info retime_info;
+	audio_resampler_t *retime_rs;
+	uint64_t retime_in, retime_out; /* samples in / out since the audio started */
+	double retime_v0;               /* video file time when the audio started */
+	double retime_drift;            /* filtered lag of the audio behind the video file time, s */
+	double retime_max_drift;
+	int retime_delta;               /* samples per second currently added (negative: removed) */
+	/* the rate of the video file time against real time, measured over the
+	 * last RETIME_RATE_HIST seconds (1 = real time; 0.9967 for a 59.8 fps
+	 * game): the trim's feed-forward, so that the lag has nothing to carry */
+	struct retime_rate_mark {
+		uint64_t ts;
+		double vtime;
+	} retime_rate_hist[RETIME_RATE_HIST];
+	long retime_rate_n;
+	double retime_rate, retime_rate_min, retime_rate_max;
+	bool retime_rate_warned;
+	/* video encoders: the (frame timestamp, pts) of the last RETIME_HIST
+	 * frames sent to the encoder, so that the audio can look up the file
+	 * time of its own timestamps (retime_file_time) instead of comparing
+	 * arrival order, which the audio buffering and the encode queues move */
+	struct retime_mark {
+		uint64_t ts;
+		int64_t pts;
+	} retime_hist[RETIME_HIST];
+	volatile long retime_hist_n; /* marks written so far */
 
 	struct deque audio_input_buffer[MAX_AV_PLANES];
 	uint8_t *audio_output_buffer[MAX_AV_PLANES];
@@ -1478,6 +1531,8 @@ extern bool start_gpu_encode(obs_encoder_t *encoder);
 extern void stop_gpu_encode(obs_encoder_t *encoder);
 
 extern bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame, const uint64_t *frame_cts);
+extern int64_t video_frame_pts(struct obs_encoder *encoder, uint64_t timestamp);
+extern void retime_mark_frame(struct obs_encoder *encoder, uint64_t timestamp, int64_t pts);
 extern void send_off_encoder_packet(obs_encoder_t *encoder, bool success, bool received, struct encoder_packet *pkt);
 
 void obs_encoder_destroy(obs_encoder_t *encoder);

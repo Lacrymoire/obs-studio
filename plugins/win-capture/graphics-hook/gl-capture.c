@@ -47,31 +47,29 @@ struct gl_data {
 	bool using_shtex;
 	bool shmem_fallback;
 
-	union {
-		/* shared texture */
-		struct {
-			struct shtex_data *shtex_info;
-			ID3D11Device *d3d11_device;
-			ID3D11DeviceContext *d3d11_context;
-			ID3D11Texture2D *d3d11_tex;
-			IDXGISwapChain *dxgi_swap;
-			HANDLE gl_device;
-			HANDLE gl_dxobj;
-			HANDLE handle;
-			HWND hwnd;
-			GLuint texture;
-		};
-		/* shared memory */
-		struct {
-			struct shmem_data *shmem_info;
-			int cur_tex;
-			int copy_wait;
-			GLuint pbos[NUM_BUFFERS];
-			GLuint textures[NUM_BUFFERS];
-			bool texture_ready[NUM_BUFFERS];
-			bool texture_mapped[NUM_BUFFERS];
-		};
-	};
+	/* shared texture(s): frame-locked capture uses a ring of ring_size
+	 * slots, one shared D3D11 texture each, registered as a GL texture
+	 * through the NV_DX_interop extension (see struct shtex_data) */
+	struct shtex_data *shtex_info;
+	ID3D11Device *d3d11_device;
+	ID3D11DeviceContext *d3d11_context;
+	ID3D11Texture2D *d3d11_tex[FRAME_RING_MAX];
+	IDXGISwapChain *dxgi_swap;
+	HANDLE gl_device;
+	HANDLE gl_dxobj[FRAME_RING_MAX];
+	HANDLE handle[FRAME_RING_MAX];
+	HWND hwnd;
+	GLuint texture[FRAME_RING_MAX];
+	uint32_t ring_size;
+
+	/* shared memory */
+	struct shmem_data *shmem_info;
+	int cur_tex;
+	int copy_wait;
+	GLuint pbos[NUM_BUFFERS];
+	GLuint textures[NUM_BUFFERS];
+	bool texture_ready[NUM_BUFFERS];
+	bool texture_mapped[NUM_BUFFERS];
 };
 
 static HMODULE gl = NULL;
@@ -95,14 +93,18 @@ static void gl_free(void)
 	capture_free();
 
 	if (data.using_shtex) {
-		if (data.gl_dxobj)
-			obsglDXUnregisterObjectNV(data.gl_device, data.gl_dxobj);
+		for (uint32_t i = 0; i < FRAME_RING_MAX; i++) {
+			if (data.gl_dxobj[i])
+				obsglDXUnregisterObjectNV(data.gl_device, data.gl_dxobj[i]);
+		}
 		if (data.gl_device)
 			obsglDXCloseDeviceNV(data.gl_device);
-		if (data.texture)
-			glDeleteTextures(1, &data.texture);
-		if (data.d3d11_tex)
-			ID3D11Resource_Release(data.d3d11_tex);
+		for (uint32_t i = 0; i < FRAME_RING_MAX; i++) {
+			if (data.texture[i])
+				glDeleteTextures(1, &data.texture[i]);
+			if (data.d3d11_tex[i])
+				ID3D11Resource_Release(data.d3d11_tex[i]);
+		}
 		if (data.d3d11_context)
 			ID3D11DeviceContext_Release(data.d3d11_context);
 		if (data.d3d11_device)
@@ -331,7 +333,8 @@ static inline bool gl_shtex_init_d3d11(void)
 	return true;
 }
 
-static inline bool gl_shtex_init_d3d11_tex(void)
+/* frame-locked capture: one shared D3D11 texture per ring slot */
+static inline bool gl_shtex_init_d3d11_tex(uint32_t slot)
 {
 	IDXGIResource *dxgi_res;
 	HRESULT hr;
@@ -347,19 +350,19 @@ static inline bool gl_shtex_init_d3d11_tex(void)
 	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-	hr = ID3D11Device_CreateTexture2D(data.d3d11_device, &desc, NULL, &data.d3d11_tex);
+	hr = ID3D11Device_CreateTexture2D(data.d3d11_device, &desc, NULL, &data.d3d11_tex[slot]);
 	if (FAILED(hr)) {
 		hlog_hr("gl_shtex_init_d3d11_tex: failed to create texture", hr);
 		return false;
 	}
 
-	hr = ID3D11Device_QueryInterface(data.d3d11_tex, &GUID_IDXGIResource, (void **)&dxgi_res);
+	hr = ID3D11Device_QueryInterface(data.d3d11_tex[slot], &GUID_IDXGIResource, (void **)&dxgi_res);
 	if (FAILED(hr)) {
 		hlog_hr("gl_shtex_init_d3d11_tex: failed to get IDXGIResource", hr);
 		return false;
 	}
 
-	hr = IDXGIResource_GetSharedHandle(dxgi_res, &data.handle);
+	hr = IDXGIResource_GetSharedHandle(dxgi_res, &data.handle[slot]);
 	IDXGIResource_Release(dxgi_res);
 
 	if (FAILED(hr)) {
@@ -378,16 +381,20 @@ static inline bool gl_shtex_init_gl_tex(void)
 		return false;
 	}
 
-	glGenTextures(1, &data.texture);
-	if (gl_error("gl_shtex_init_gl_tex", "failed to generate texture")) {
-		return false;
-	}
+	/* frame-locked capture: every ring slot gets its own GL texture and
+	 * interop object; a slot is locked only while it is being written */
+	for (uint32_t i = 0; i < data.ring_size; i++) {
+		glGenTextures(1, &data.texture[i]);
+		if (gl_error("gl_shtex_init_gl_tex", "failed to generate texture")) {
+			return false;
+		}
 
-	data.gl_dxobj = obsglDXRegisterObjectNV(data.gl_device, data.d3d11_tex, data.texture, GL_TEXTURE_2D,
-						WGL_ACCESS_WRITE_DISCARD_NV);
-	if (!data.gl_dxobj) {
-		hlog("gl_shtex_init_gl_tex: failed to register object");
-		return false;
+		data.gl_dxobj[i] = obsglDXRegisterObjectNV(data.gl_device, data.d3d11_tex[i], data.texture[i],
+							   GL_TEXTURE_2D, WGL_ACCESS_WRITE_DISCARD_NV);
+		if (!data.gl_dxobj[i]) {
+			hlog("gl_shtex_init_gl_tex: failed to register object (slot %u of %u)", i, data.ring_size);
+			return false;
+		}
 	}
 
 	return true;
@@ -401,14 +408,22 @@ static inline bool gl_init_fbo(void)
 
 static bool gl_shtex_init(HWND window)
 {
+	uintptr_t handles[FRAME_RING_MAX];
+
+	data.ring_size = capture_ring_size_wanted();
+
 	if (!gl_shtex_init_window()) {
 		return false;
 	}
 	if (!gl_shtex_init_d3d11()) {
 		return false;
 	}
-	if (!gl_shtex_init_d3d11_tex()) {
-		return false;
+	for (uint32_t i = 0; i < data.ring_size; i++) {
+		if (!gl_shtex_init_d3d11_tex(i)) {
+			hlog("gl_shtex_init: failed to create texture (slot %u of %u)", i, data.ring_size);
+			return false;
+		}
+		handles[i] = (uintptr_t)data.handle[i];
 	}
 	if (!gl_shtex_init_gl_tex()) {
 		return false;
@@ -416,12 +431,12 @@ static bool gl_shtex_init(HWND window)
 	if (!gl_init_fbo()) {
 		return false;
 	}
-	if (!capture_init_shtex(&data.shtex_info, window, data.cx, data.cy, data.format, true,
-				(uintptr_t)data.handle)) {
+	if (!capture_init_shtex_ring(&data.shtex_info, window, data.cx, data.cy, data.format, true, handles,
+				     data.ring_size)) {
 		return false;
 	}
 
-	hlog("gl shared texture capture successful");
+	hlog("gl shared texture capture successful (%u slot%s)", data.ring_size, data.ring_size == 1 ? "" : "s");
 	return true;
 }
 
@@ -579,26 +594,38 @@ static void gl_shtex_capture(void)
 	GLint last_fbo;
 	GLint last_tex;
 
-	obsglDXLockObjectsNV(data.gl_device, 1, &data.gl_dxobj);
+	/* frame-locked capture: blit this present into the next free ring slot
+	 * and record (counter, present time, slot) in the shared present log,
+	 * as the D3D paths do.  The stock code's early returns on a GL error
+	 * left the interop object locked; the slot is unlocked on every path. */
+	const uint32_t slot = capture_next_slot(data.shtex_info);
+	bool copied = false;
+
+	obsglDXLockObjectsNV(data.gl_device, 1, &data.gl_dxobj[slot]);
 
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &last_fbo);
 	if (gl_error("gl_shtex_capture", "failed to get last fbo")) {
-		return;
+		goto unlock;
 	}
 
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
 	if (gl_error("gl_shtex_capture", "failed to get last texture")) {
-		return;
+		goto unlock;
 	}
 
-	gl_copy_backbuffer(data.texture);
+	gl_copy_backbuffer(data.texture[slot]);
+	copied = true;
 
 	glBindTexture(GL_TEXTURE_2D, last_tex);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, last_fbo);
 
-	obsglDXUnlockObjectsNV(data.gl_device, 1, &data.gl_dxobj);
+unlock:
+	obsglDXUnlockObjectsNV(data.gl_device, 1, &data.gl_dxobj[slot]);
 
 	IDXGISwapChain_Present(data.dxgi_swap, 0, 0);
+
+	if (copied)
+		capture_log_present(data.shtex_info, slot);
 }
 
 static void gl_shmem_capture_copy(int i)
@@ -705,7 +732,7 @@ static void gl_capture(HDC hdc)
 	/* reset error flag */
 	glGetError();
 
-	if (capture_should_stop()) {
+	if (capture_should_stop() || capture_ring_resize_wanted(data.shtex_info)) {
 		gl_free();
 	}
 	if (capture_should_init()) {
@@ -733,13 +760,50 @@ static void gl_capture(HDC hdc)
 	}
 }
 
+static struct hook_in_front swap_front;
+static struct hook_in_front wgl_swap_front;
+static struct hook_in_front wgl_swap_layer_front;
+static bool front_checked_active = false;
+
+/* at every swap the capture copied: (re)check who is in front of our hooks
+ * when a capture has just started (see graphics-hook.h) */
+static inline void gl_front_check(void)
+{
+	const bool now = capture_active();
+	if (now && !front_checked_active) {
+		hook_in_front_install(&swap_front);
+		hook_in_front_install(&wgl_swap_front);
+		hook_in_front_install(&wgl_swap_layer_front);
+	}
+	front_checked_active = now;
+}
+
 static inline void gl_swap_begin(HDC hdc)
 {
 	const bool first = swap_recurse == 0;
 	++swap_recurse;
 
-	if (first && !global_hook_info->capture_overlay)
+	if (first && !global_hook_info->capture_overlay && captured_in_front == 0) {
 		gl_capture(hdc);
+		gl_front_check();
+	}
+}
+
+/* the copy for a swap whose hook we got in front of */
+static inline bool gl_swap_front_begin(HDC hdc)
+{
+	if (captured_in_front != 0 || swap_recurse != 0 || global_hook_info->capture_overlay)
+		return false;
+
+	gl_capture(hdc);
+	++captured_in_front;
+	return true;
+}
+
+static inline void gl_swap_front_end(bool took)
+{
+	if (took)
+		--captured_in_front;
 }
 
 static inline void gl_swap_end(HDC hdc)
@@ -781,6 +845,30 @@ static BOOL WINAPI hook_wgl_swap_layer_buffers(HDC hdc, UINT planes)
 
 	gl_swap_end(hdc);
 
+	return ret;
+}
+
+static BOOL WINAPI hook_swap_buffers_front(HDC hdc)
+{
+	const bool took = gl_swap_front_begin(hdc);
+	const BOOL ret = ((PFN_SwapBuffers)swap_front.real)(hdc);
+	gl_swap_front_end(took);
+	return ret;
+}
+
+static BOOL WINAPI hook_wgl_swap_buffers_front(HDC hdc)
+{
+	const bool took = gl_swap_front_begin(hdc);
+	const BOOL ret = ((PFN_WglSwapBuffers)wgl_swap_front.real)(hdc);
+	gl_swap_front_end(took);
+	return ret;
+}
+
+static BOOL WINAPI hook_wgl_swap_layer_buffers_front(HDC hdc, UINT planes)
+{
+	const bool took = gl_swap_front_begin(hdc);
+	const BOOL ret = ((PFN_WglSwapLayerBuffers)wgl_swap_layer_front.real)(hdc, planes);
+	gl_swap_front_end(took);
 	return ret;
 }
 
@@ -861,6 +949,23 @@ bool hook_gl(void)
 	const LONG error = DetourTransactionCommit();
 	const bool success = error == NO_ERROR;
 	if (success) {
+		swap_front.target = (void *)SwapBuffers;
+		swap_front.inner = (void *)hook_swap_buffers;
+		swap_front.outer = (void *)hook_swap_buffers_front;
+		swap_front.name = "SwapBuffers";
+		if (wgl_sb_proc) {
+			wgl_swap_front.target = wgl_sb_proc;
+			wgl_swap_front.inner = (void *)hook_wgl_swap_buffers;
+			wgl_swap_front.outer = (void *)hook_wgl_swap_buffers_front;
+			wgl_swap_front.name = "wglSwapBuffers";
+		}
+		if (wgl_slb_proc) {
+			wgl_swap_layer_front.target = wgl_slb_proc;
+			wgl_swap_layer_front.inner = (void *)hook_wgl_swap_layer_buffers;
+			wgl_swap_layer_front.outer = (void *)hook_wgl_swap_layer_buffers_front;
+			wgl_swap_layer_front.name = "wglSwapLayerBuffers";
+		}
+
 		hlog("Hooked SwapBuffers");
 		if (RealWglDeleteContext)
 			hlog("Hooked wglDeleteContext");
