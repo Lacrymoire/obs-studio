@@ -51,7 +51,7 @@ game timeline, slightly delayed. On top of that:
 
 | Where | Setting | Default | Effect |
 |---|---|---|---|
-| Game Capture | Buffering | on | Frames are chosen on the game's timeline; off = stock (newest frame). Changing it re-hooks the game. |
+| Game Capture | Buffering | on | Frames are chosen on the game's timeline; off = stock (newest frame). Takes effect at once (the capture restarts once). |
 | Game Capture | Buffer delay (frames) | 2 | Video delay; the properties show the matching audio Sync Offset. |
 | Game Capture | Frame ring limit | 32 | Most frames the hook may keep; the ring starts small and grows only when the game needs it (each slot is one frame of video memory, 33 MB at 4K). 1 = stock single texture. |
 | Game Capture | Frame-lock debug log | off | Writes `<recording>.frames.csv` next to each recording, for diagnosis. |
@@ -78,9 +78,13 @@ not been tested with them.
   games with DLSS frame generation (Streamline) keep RTSS at its default
   settings; with "Custom Direct3D support" on, its display can end up in the
   video, and Witcher 3 crashed at start.
-- Vulkan and OpenGL games load the hook from
-  `%ProgramData%\obs-studio-hook`. This build keeps that copy equal to its own
-  hook at start; a stock OBS started later replaces it with the stock hook.
+- The hook in `%ProgramData%\obs-studio-hook` is the one Vulkan and OpenGL
+  games load at start, and the only one Microsoft Store and Game Pass games can
+  load. This build makes that copy equal to its own hook when OBS starts and
+  injects it while it stays so. A stock OBS started later replaces it with the
+  stock hook: Vulkan/OpenGL games then load the stock hook, other games get
+  this build's own copy, and Store games cannot be captured until this build
+  is restarted.
 - Below about 57 fps on a 60 fps canvas (more than 5 % slow) no cadence fits
   and the source records like the plain buffered mode.
 

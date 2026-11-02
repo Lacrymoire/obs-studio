@@ -94,19 +94,28 @@ struct vtable_front {
 	const char *name;
 	bool checked;
 	bool failed;
+	bool looped; /* vt_front_reentered was logged */
 };
 
 static HRESULT STDMETHODCALLTYPE hook_present_vt_front(IDXGISwapChain *swap, UINT sync_interval, UINT flags);
 static HRESULT STDMETHODCALLTYPE hook_present1_vt_front(IDXGISwapChain1 *swap, UINT sync_interval, UINT flags,
 							const DXGI_PRESENT_PARAMETERS *params);
+static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_interval, UINT flags);
+static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_interval, UINT flags,
+					       const DXGI_PRESENT_PARAMETERS *params);
 
 static struct vtable_front vt_present = {nullptr, nullptr, nullptr, 0, (void *)hook_present_vt_front,
 					 nullptr, nullptr, nullptr, 8, "IDXGISwapChain::Present",
-					 false,   false};
+					 false,   false,   false};
 static struct vtable_front vt_present1 = {nullptr, nullptr, nullptr, 0,  (void *)hook_present1_vt_front,
 					  nullptr, nullptr, nullptr, 22, "IDXGISwapChain1::Present1",
-					  false,   false};
+					  false,   false,   false};
 static bool vt_checked_active = false;
+static IDXGISwapChain *vt1_swap = nullptr; /* swap chain vt1_ok was asked for */
+static bool vt1_ok = false;
+/* the swap chain each front is running for on this thread (see vt_front_reentered) */
+static thread_local IDXGISwapChain *vt_present_in = nullptr;
+static thread_local IDXGISwapChain *vt_present1_in = nullptr;
 
 static void dxgi_log_overlay_modules(void)
 {
@@ -215,11 +224,32 @@ static inline void dxgi_vt_front_check(IDXGISwapChain *swap)
 	if (now && !vt_checked_active)
 		dxgi_log_overlay_modules();
 	vt_checked_active = now;
-	if (!now || swap != data.swap)
+	if (!now) {
+		vt1_swap = nullptr; /* a new capture may have a new swap chain at the same address */
 		return;
+	}
+	if (swap != data.swap) {
+		return;
+	}
 	vtable_front_check(&vt_present, swap);
-	if (vt_present1.target)
-		vtable_front_check(&vt_present1, swap);
+	if (vt_present1.target) {
+		/* slot 22 is Present1 only in a table that implements
+		 * IDXGISwapChain1 on the same object (a wrapper swap chain may
+		 * have a shorter one); asked once per captured swap chain */
+		if (swap != vt1_swap) {
+			IDXGISwapChain1 *swap1 = nullptr;
+
+			vt1_swap = swap;
+			vt1_ok = false;
+			if (SUCCEEDED(swap->QueryInterface(__uuidof(IDXGISwapChain1), (void **)&swap1)) && swap1) {
+				vt1_ok = (void *)swap1 == (void *)swap && *(void ***)swap1 == *(void ***)swap;
+				swap1->Release();
+			}
+		}
+		if (vt1_ok) {
+			vtable_front_check(&vt_present1, swap);
+		}
+	}
 }
 
 /* the checks hook_present runs, for a front function that took the copy: the
@@ -267,14 +297,40 @@ static void *vtable_front_next(struct vtable_front *f)
 	return f->target;
 }
 
+/* A front entered again for the same swap chain on the same thread, from
+ * inside the function it called: a hook that puts itself back into the table
+ * at every call (saving our front as what it calls next) would otherwise call
+ * our front, which calls it, which calls our front, until the stack runs out.
+ * The inner call goes straight to our detour (the system's present). */
+static bool vt_front_reentered(struct vtable_front *f, IDXGISwapChain *in, IDXGISwapChain *swap)
+{
+	if (in != swap) {
+		return false;
+	}
+	if (!f->looped) {
+		f->looped = true;
+		hlog("frame-lock: %s: the function we hooked in front of calls the method table again; that "
+		     "call goes straight to the present",
+		     f->name);
+	}
+	return true;
+}
+
 static HRESULT STDMETHODCALLTYPE hook_present_vt_front(IDXGISwapChain *swap, UINT sync_interval, UINT flags)
 {
+	if (vt_front_reentered(&vt_present, vt_present_in, swap)) {
+		return hook_present(swap, sync_interval, flags);
+	}
+
+	IDXGISwapChain *const outer = vt_present_in;
 	const bool took = dxgi_capture_in_front(swap, flags);
 	if (took) {
 		dxgi_front_checks_in_front(swap);
 		++captured_in_front;
 	}
+	vt_present_in = swap;
 	const HRESULT hr = ((present_t)vtable_front_next(&vt_present))(swap, sync_interval, flags);
+	vt_present_in = outer;
 	if (took)
 		--captured_in_front;
 	return hr;
@@ -283,12 +339,19 @@ static HRESULT STDMETHODCALLTYPE hook_present_vt_front(IDXGISwapChain *swap, UIN
 static HRESULT STDMETHODCALLTYPE hook_present1_vt_front(IDXGISwapChain1 *swap, UINT sync_interval, UINT flags,
 							const DXGI_PRESENT_PARAMETERS *params)
 {
+	if (vt_front_reentered(&vt_present1, vt_present1_in, swap)) {
+		return hook_present1(swap, sync_interval, flags, params);
+	}
+
+	IDXGISwapChain *const outer = vt_present1_in;
 	const bool took = dxgi_capture_in_front(swap, flags);
 	if (took) {
 		dxgi_front_checks_in_front(swap);
 		++captured_in_front;
 	}
+	vt_present1_in = swap;
 	const HRESULT hr = ((present1_t)vtable_front_next(&vt_present1))(swap, sync_interval, flags, params);
+	vt_present1_in = outer;
 	if (took)
 		--captured_in_front;
 	return hr;

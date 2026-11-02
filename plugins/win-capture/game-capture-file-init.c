@@ -188,22 +188,63 @@ static LSTATUS get_reg(HKEY hkey, LPCWSTR sub_key, LPCWSTR value_name, bool b64)
 static bool programdata64_hook_exists = false;
 static bool programdata32_hook_exists = false;
 
+/* Frame-locked build: the %ProgramData% copy was found identical to this
+ * build's hook (or made so) at startup; its size and write time then, to see
+ * a later replacement (a stock OBS started since) without reading the file */
+struct hook_stamp {
+	bool ours;
+	FILETIME written;
+	DWORD size_high, size_low;
+};
+static struct hook_stamp programdata64_stamp = {0};
+static struct hook_stamp programdata32_stamp = {0};
+
+static bool hook_stamp_read(const wchar_t *path, struct hook_stamp *stamp)
+{
+	WIN32_FILE_ATTRIBUTE_DATA fad;
+
+	if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+		return false;
+	}
+	stamp->written = fad.ftLastWriteTime;
+	stamp->size_high = fad.nFileSizeHigh;
+	stamp->size_low = fad.nFileSizeLow;
+	return true;
+}
+
+static bool hook_stamp_unchanged(const wchar_t *path, const struct hook_stamp *stamp)
+{
+	struct hook_stamp now = {0};
+
+	return stamp->ours && hook_stamp_read(path, &now) && CompareFileTime(&now.written, &stamp->written) == 0 &&
+	       now.size_high == stamp->size_high && now.size_low == stamp->size_low;
+}
+
 char *get_hook_path(bool b64)
 {
 	wchar_t path[MAX_PATH];
 
-	/* Frame-locked build: inject the graphics hook shipped next to this
-	 * plugin (core\win-capture\data), never the copy in
-	 * %ProgramData%\obs-studio-hook.  update_hook_file() only replaces that
-	 * copy when our file version is higher, and this build carries the same
-	 * version as the stock OBS that installed it, so the stock hook (without
-	 * the present log) would be injected instead of ours. */
+	get_programdata_path(path, L"obs-studio-hook\\");
+	make_filename(path, L"graphics-hook", L".dll");
+
+	/* Frame-locked build: inject the %ProgramData% copy only while it is
+	 * this build's hook.  That folder carries the permission Microsoft
+	 * Store / Game Pass (app container) games need to load a DLL, which a
+	 * portable folder does not; but update_hook_file() found it holding
+	 * the stock hook (without the present log) on an OBS installed with
+	 * the same version, so anything else injects the hook shipped next to
+	 * this plugin (core\win-capture\data). */
+	if (hook_stamp_unchanged(path, b64 ? &programdata64_stamp : &programdata32_stamp)) {
+		char *path_utf8 = NULL;
+		os_wcs_to_utf8_ptr(path, 0, &path_utf8);
+		if (path_utf8) {
+			return path_utf8;
+		}
+	}
+
 	char *own_hook = obs_module_file(b64 ? "graphics-hook64.dll" : "graphics-hook32.dll");
 	if (own_hook)
 		return own_hook;
-
-	get_programdata_path(path, L"obs-studio-hook\\");
-	make_filename(path, L"graphics-hook", L".dll");
 
 	if ((b64 && programdata64_hook_exists) || (!b64 && programdata32_hook_exists)) {
 		char *path_utf8 = NULL;
@@ -222,7 +263,7 @@ char *get_hook_path(bool b64)
 #undef warn
 #define warn(format, ...) blog(LOG_WARNING, "update_hook_file: " format, ##__VA_ARGS__)
 
-static bool update_hook_file(bool b64)
+static bool update_hook_file(bool b64, struct hook_stamp *stamp)
 {
 	wchar_t temp[MAX_PATH];
 	wchar_t src[MAX_PATH];
@@ -278,6 +319,7 @@ static bool update_hook_file(bool b64)
 			warn("failed to install %ls (%lu)", dst, GetLastError());
 			return false;
 		}
+		stamp->ours = hook_stamp_read(dst, stamp);
 		return true;
 	}
 
@@ -337,9 +379,11 @@ static bool update_hook_file(bool b64)
 			     dst, GetLastError());
 		} else {
 			blog(LOG_INFO, "frame-lock: updated %ls to this build's graphics hook", dst);
+			stamp->ours = hook_stamp_read(dst, stamp);
 		}
 	} else {
 		blog(LOG_INFO, "frame-lock: %ls is this build's graphics hook", dst);
+		stamp->ours = hook_stamp_read(dst, stamp);
 	}
 
 	return true;
@@ -409,11 +453,11 @@ finish:
 
 void init_hook_files()
 {
-	if (update_hook_file(true)) {
+	if (update_hook_file(true, &programdata64_stamp)) {
 		programdata64_hook_exists = true;
 		init_vulkan_registry(true);
 	}
-	if (update_hook_file(false)) {
+	if (update_hook_file(false, &programdata32_stamp)) {
 		programdata32_hook_exists = true;
 		init_vulkan_registry(false);
 	}

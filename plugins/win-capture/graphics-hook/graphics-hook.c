@@ -893,6 +893,11 @@ static bool code_readable(const void *p, size_t n)
  * stub, and an incremental link reaches functions through jump thunks) */
 static const void *jump_target(const uint8_t *p)
 {
+	/* jmp rel8: a hot-patch entry (32-bit system DLLs) jumps back into
+	 * the padding before the function, where the long jump sits */
+	if (code_readable(p, 2) && p[0] == 0xEB) {
+		return p + 2 + *(const int8_t *)(p + 1);
+	}
 	if (!code_readable(p, 12))
 		return NULL;
 	if (p[0] == 0xE9) /* jmp rel32 */

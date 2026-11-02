@@ -135,7 +135,11 @@ struct game_capture_config {
 /* frame-locked capture, Phase 3 constants */
 #define LOCK_FIT_N 128          /* present records in the least-squares window (about 2 s at 60 fps) */
 #define LOCK_FIT_MIN 16         /* records before the fitted clock is trusted */
-#define LOCK_MAX_DELAY (FRAME_RING_MAX - 3)
+/* slots a ring needs beyond the buffer delay: the newest frame, one frame of
+ * margin for a present that comes early, the slot the hook writes next and the
+ * slot OBS shows, which the hook steps over (capture_next_slot) */
+#define RING_MARGIN 4
+#define LOCK_MAX_DELAY (FRAME_RING_MAX - RING_MARGIN)
 #define LOCK_HYSTERESIS 0.1     /* frames; a repeat or skip needs the timeline this far past the edge */
 #define LOCK_MAX_COUNTER_GAP 16 /* presents missing in a row: the game paused, refit from scratch */
 #define LOCK_MAX_TIME_GAP_NS 250000000ULL
@@ -618,6 +622,9 @@ static void lock_reopen(struct game_capture *gc)
 	gc->lock.misses = misses;
 	gc->lock.period_ns = period_ns;
 	gc->lock.ready = ready;
+	/* the period is carried until the new window is as mature as the one
+	 * it came from (a few records across a re-hook can read far off) */
+	gc->lock.carried = ready;
 	gc->lock.fresh = true;
 }
 
@@ -741,6 +748,14 @@ static uint32_t lock_burst_runs(const struct game_capture *gc)
 			runs++;
 		prev = sh;
 	}
+	/* a full window that starts and ends inside a burst holds the tail of
+	 * one burst and the start of another: for a steady stream the two make
+	 * one burst's worth, so count them once (else 6x generation, 4 bursts
+	 * of 5 short gaps in 24, reads as 5 runs and a factor of 5) */
+	if (gc->lock.burst_n == LOCK_BURST_WIN && runs > 1 && gc->lock.burst_short[first] &&
+	    gc->lock.burst_short[(first + LOCK_BURST_WIN - 1) % LOCK_BURST_WIN]) {
+		runs--;
+	}
 	return runs;
 }
 
@@ -802,8 +817,17 @@ static uint64_t lock_pace(struct game_capture *gc, uint64_t time_ns)
 			paced = gc->lock.burst_paced_last_ns + step;
 		if (paced > cap)
 			paced = cap;
-		if (paced != time_ns)
-			gc->lock.burst_moved++;
+	}
+	/* never a step back: the cap follows the mean gap, which drops when a
+	 * long gap leaves the window, and a stream leaving burst mode returns to
+	 * its present times while the last paced time may still be ahead of
+	 * them; a paced time before the previous one would read as a pause of
+	 * 2^64 ns in lock_add (a false re-anchor) */
+	if (paced < gc->lock.burst_paced_last_ns) {
+		paced = gc->lock.burst_paced_last_ns;
+	}
+	if (paced != time_ns) {
+		gc->lock.burst_moved++;
 	}
 	gc->lock.burst_paced_last_ns = paced;
 	return paced;
@@ -953,7 +977,8 @@ static uint64_t lock_add(struct game_capture *gc, uint64_t counter, uint64_t tim
 	uint64_t v;
 
 	if (gc->lock.ready && (gc->lock.n || gc->lock.pending_n)) {
-		const uint64_t gap = time_ns - gc->lock.last_time_ns;
+		/* (present times can tie or cross between threads that present) */
+		const uint64_t gap = time_ns > gc->lock.last_time_ns ? time_ns - gc->lock.last_time_ns : 0;
 		double err;
 
 		if (counter <= gc->lock.last_counter) {
@@ -977,6 +1002,12 @@ static uint64_t lock_add(struct game_capture *gc, uint64_t counter, uint64_t tim
 				const uint32_t i = (uint32_t)((gc->lock.last_counter - 1) % PRESENT_LOG_SIZE);
 				if (gc->lock.vlog[i].counter == gc->lock.last_counter)
 					gc->lock.vlog[i].v -= k;
+			}
+			/* and if that frame is already on screen, its slot as the
+			 * choice remembers it, or the catch-up frame (which now takes
+			 * that slot) would read as a repeat, then be skipped */
+			if (gc->lock.active && gc->lock.shown == gc->lock.last_counter && gc->lock.shown_v >= k) {
+				gc->lock.shown_v -= k;
 			}
 		}
 		gc->lock.last_miss = 0;
@@ -1066,7 +1097,7 @@ static uint64_t lock_add(struct game_capture *gc, uint64_t counter, uint64_t tim
 	/* cold start: no trusted clock yet */
 	if (gc->lock.n) {
 		const uint64_t dc = counter - gc->lock.last_counter;
-		const uint64_t dt = time_ns - gc->lock.last_time_ns;
+		const uint64_t dt = time_ns > gc->lock.last_time_ns ? time_ns - gc->lock.last_time_ns : 0;
 
 		if (counter <= gc->lock.last_counter) {
 			gc->lock.skew = 0;
@@ -1110,7 +1141,7 @@ static void lock_fit(struct game_capture *gc)
 	my = sy / n;
 	{
 		const uint32_t oldest = (newest + LOCK_FIT_N - (n - 1)) % LOCK_FIT_N;
-		gc->lock.span_ns = t0 - gc->lock.times[oldest];
+		gc->lock.span_ns = t0 > gc->lock.times[oldest] ? t0 - gc->lock.times[oldest] : 0;
 	}
 	if (n < LOCK_FIT_MIN ||
 	    (gc->lock.carried && n < LOCK_FIT_N && gc->lock.span_ns < LOCK_ENGAGE_SPAN_NS)) {
@@ -1149,16 +1180,16 @@ static void lock_fit(struct game_capture *gc)
 	}
 }
 
-/* the buffer delay this tick.  Phase 6: the ring holds ring - 2 safe frames;
- * at a high game rate the delay would reach past them, so it is shortened to
- * what the ring holds (the video is then that much less delayed for this
- * game) */
+/* the buffer delay this tick.  Phase 6: the ring holds ring - 2 safe frames
+ * (ring_tick), one of which is the margin; at a high game rate the delay would
+ * reach past them, so it is shortened to what the ring holds (the video is
+ * then that much less delayed for this game) */
 static uint64_t lock_delay(struct game_capture *gc)
 {
 	uint64_t delay_ns = (uint64_t)gc->config.buffer_delay * obs_get_frame_interval_ns();
 
-	if (gc->ring.size >= 4) {
-		const double fit = (double)(gc->ring.size - 3) * gc->lock.period_ns;
+	if (gc->ring.size >= RING_MARGIN) {
+		const double fit = (double)(gc->ring.size - RING_MARGIN) * gc->lock.period_ns;
 		if ((double)delay_ns > fit) {
 			delay_ns = (uint64_t)fit;
 			if (!gc->lock.ring_short_logged) {
@@ -1445,7 +1476,7 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 /* Frame-locked capture, automatic ring size.
  *
  * Every slot is a full frame of video memory (33 MB at 4K BGRA, twice that for
- * a 16-bit float HDR game), so the ring starts at buffer delay + 3 slots, the
+ * a 16-bit float HDR game), so the ring starts at buffer delay + 4 slots, the
  * least lock_delay needs for a game at or below the output rate, and grows
  * only when this game needs more: a present rate above the output rate makes
  * the delay span more frames, and a frame-generation stream presents a whole
@@ -1465,7 +1496,7 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 
 static inline uint32_t ring_start_size(const struct game_capture *gc)
 {
-	const uint32_t least = gc->config.buffer_delay + 3;
+	const uint32_t least = gc->config.buffer_delay + RING_MARGIN;
 
 	if (!gc->config.buffering)
 		return 1;
@@ -1494,14 +1525,15 @@ static void ring_grow_check(struct game_capture *gc)
 		return; /* the last request is still being carried out */
 
 	if (gc->lock.burst || gc->lock.period_ns * RING_GROW_MAX_RATE >= interval * 0.95) {
-		/* frames the delay spans at this rate, the newest frame, the slot
-		 * the hook writes next and one of margin (lock_delay).  In burst
+		/* frames the delay spans at this rate plus RING_MARGIN (the newest
+		 * frame, one of margin, the slot the hook writes next and the slot
+		 * OBS shows; lock_delay).  In burst
 		 * mode the period is the paced one (Phase 8: the generated frames
 		 * spread evenly over the render interval) and every one of those
 		 * presents takes a slot, so the rate counts however high it is:
-		 * 6x frame generation at 84 fps = 504 presents/s = 17 + 3 slots */
+		 * 6x frame generation at 84 fps = 504 presents/s = 17 + 4 slots */
 		const double delay_ns = (double)gc->config.buffer_delay * interval;
-		needed = (uint32_t)ceil(delay_ns / gc->lock.period_ns) + 3;
+		needed = (uint32_t)ceil(delay_ns / gc->lock.period_ns) + RING_MARGIN;
 		why = gc->lock.burst ? "frame-generation bursts" : "present rate";
 	}
 	if (gc->lock.burst) {
@@ -1616,6 +1648,24 @@ static bool cadence_choose(double r, double band, uint32_t max_n, uint32_t *out_
 	return true;
 }
 
+/* the game-clock output stops following this source (no cadence any more, or
+ * the capture stopped: libobs falls back to its own grid at the next tick
+ * nobody stamps) */
+static void game_clock_release(struct game_capture *gc)
+{
+	if (!gc->lock.vfr) {
+		return;
+	}
+	info("game-clock output: released (%" PRIu64 " ticks, %" PRIu64 " paced, %" PRIu64 " starved, %" PRIu64
+	     " after refits, %" PRIu64 " repeats, %" PRIu64 " cadence changes)",
+	     gc->lock.vfr_frames, gc->lock.vfr_paced, gc->lock.vfr_starved, gc->lock.vfr_fresh, gc->lock.vfr_repeats,
+	     gc->lock.cad_changes);
+	gc->lock.vfr = false;
+	gc->lock.vfr_now = false;
+	gc->lock.cad_m = gc->lock.cad_n = 0;
+	gc->lock.cad_out_ns = 0;
+}
+
 static void game_clock_tick(struct game_capture *gc, bool repeat)
 {
 	uint64_t frame_ts = 0, next_tick = 0;
@@ -1721,15 +1771,8 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 			     1e9 / gc->lock.period_ns, gc->lock.period_ns / 1000000.0,
 			     obs_get_frame_interval_ns() / 1000000.0, gc->lock.cad_m, gc->lock.cad_n, gc->lock.cad_e * 100.0);
 		else
-			info("game-clock output: released (%" PRIu64 " ticks, %" PRIu64 " paced, %" PRIu64
-			     " starved, %" PRIu64 " after refits, %" PRIu64 " repeats, %" PRIu64 " cadence changes)",
-			     gc->lock.vfr_frames, gc->lock.vfr_paced, gc->lock.vfr_starved, gc->lock.vfr_fresh,
-			     gc->lock.vfr_repeats, gc->lock.cad_changes);
+			game_clock_release(gc);
 		gc->lock.vfr = vfr;
-		if (!vfr) {
-			gc->lock.cad_m = gc->lock.cad_n = 0;
-			gc->lock.cad_out_ns = 0;
-		}
 	}
 	gc->lock.vfr_now = vfr && !gc->lock.starved_now && !gc->lock.fresh;
 	obs_video_set_game_clock_tick(frame_ts, next_tick, skip);
@@ -1801,9 +1844,15 @@ static void ring_tick(struct game_capture *gc)
 		return;
 
 	{
-		/* a frame is safe to switch to while it is newer than
-		 * newest - (ring - 2): the hook writes the slot after the newest */
-		const uint64_t keep = gc->ring.size > 2 ? gc->ring.size - 2 : 0;
+		/* a frame is safe to switch to while it is at least newest -
+		 * (ring - 3).  The slot OBS shows is pinned (the hook steps over
+		 * it), so the other ring - 1 slots hold the newest frames, and when
+		 * the frame on screen is the oldest in the ring the hook's next
+		 * write lands on the slot after it: newest - (ring - 2) can be
+		 * overwritten before OBS draws it, and once the hook has stepped
+		 * over the shown slot a frame that recent may already hold a newer
+		 * one (a frame from the future, then a step back) */
+		const uint64_t keep = gc->ring.size > 3 ? gc->ring.size - 3 : 0;
 		const uint64_t oldest = count > keep ? count - keep : 1;
 		uint64_t c = count;
 
@@ -1842,9 +1891,23 @@ static void ring_tick(struct game_capture *gc)
 			gc->lock.active = false;
 		}
 
+		if (c == gc->ring.shown_counter) {
+			/* the frame on screen again: its slot is pinned, so it
+			 * needs no record (after a long stall the present log may
+			 * no longer hold it) */
+			game_clock_tick(gc, true);
+			return;
+		}
 		rec = &shtex->present_log[(c - 1) % PRESENT_LOG_SIZE];
-		if (rec->counter != c)
+		if (rec->counter != c) {
+			/* overwritten: show the newest frame, and tell the lock so
+			 * its next step starts from what is on screen */
 			rec = &shtex->present_log[(count - 1) % PRESENT_LOG_SIZE];
+			if (gc->lock.active && rec->counter) {
+				gc->lock.shown = rec->counter;
+				gc->lock.shown_v = lock_v_of(gc, rec->counter);
+			}
+		}
 	}
 
 	if (rec->counter == gc->ring.shown_counter) {
@@ -2127,6 +2190,9 @@ static void flog_tick(struct game_capture *gc)
 		const uint64_t counter = rec->counter;
 		uint64_t miss = 0;
 
+		if (counter != read + 1) {
+			continue; /* overwritten by a newer present before this tick read it (as in ring_tick) */
+		}
 		if (gc->ring.size && counter > 1) {
 			/* Phase 6: slots the game skipped before this present */
 			const uint64_t v = lock_v_of(gc, counter), vp = lock_v_of(gc, counter - 1);
@@ -2266,6 +2332,15 @@ static void stop_capture(struct game_capture *gc)
 	gc->wait_for_target_startup = false;
 	gc->active = false;
 
+	/* the next hook may be another game: its clock starts from nothing
+	 * (a re-hook inside the same game does not come here and keeps the
+	 * period, see lock_reopen); the statistics are kept for the recording */
+	game_clock_release(gc);
+	gc->lock.ready = false;
+	gc->lock.period_ns = 0.0;
+	gc->lock.wander = false;
+	gc->lock.wander_last_ns = 0;
+
 	if (gc->retrying)
 		gc->retrying--;
 }
@@ -2352,10 +2427,12 @@ static inline void get_config(struct game_capture_config *cfg, obs_data_t *setti
 		cfg->buffer_delay = 1;
 	if (cfg->buffer_delay > LOCK_MAX_DELAY)
 		cfg->buffer_delay = LOCK_MAX_DELAY;
-	/* the shown frame sits delay (+1) frames behind the newest one and the
-	 * hook writes one slot ahead, so the ring must hold delay + 3 slots */
-	if (cfg->buffering && cfg->frame_ring < cfg->buffer_delay + 3)
-		cfg->frame_ring = cfg->buffer_delay + 3;
+	/* the shown frame sits delay (+1) frames behind the newest one, the hook
+	 * writes one slot ahead and steps over the shown slot, so the ring must
+	 * hold delay + RING_MARGIN slots */
+	if (cfg->buffering && cfg->frame_ring < cfg->buffer_delay + RING_MARGIN) {
+		cfg->frame_ring = cfg->buffer_delay + RING_MARGIN;
+	}
 }
 
 static inline int s_cmp(const char *str1, const char *str2)
@@ -2384,15 +2461,9 @@ static inline bool capture_needs_reset(struct game_capture_config *cfg1, struct 
 
 	} else if (cfg1->capture_overlays != cfg2->capture_overlays) {
 		return true;
-
-	} else if (cfg1->frame_ring != cfg2->frame_ring) {
-		return true;
-
-	} else if (cfg1->buffering != cfg2->buffering) {
-		/* frame-locked capture: the ring size is chosen at hook time
-		 * (ring_start_size), so turning Buffering on or off re-hooks */
-		return true;
 	}
+	/* frame-locked capture: Buffering, the delay and the ring limit need no
+	 * re-hook; game_capture_update asks the hook for the new ring size */
 
 	return false;
 }
@@ -2448,6 +2519,8 @@ static void game_capture_get_hooked(void *data, calldata_t *cd)
 	}
 }
 
+static inline void reset_frame_interval(struct game_capture *gc);
+
 static void game_capture_update(void *data, obs_data_t *settings)
 {
 	struct game_capture *gc = data;
@@ -2466,9 +2539,14 @@ static void game_capture_update(void *data, obs_data_t *settings)
 		gc->activate_hook = !!window && !!*window;
 	}
 
+	const bool ring_changed = cfg.buffering != gc->config.buffering ||
+				  cfg.buffer_delay != gc->config.buffer_delay ||
+				  cfg.frame_ring != gc->config.frame_ring;
+	const bool lock_changed = ring_changed || cfg.frame_log != gc->config.frame_log;
+
 	free_config(&gc->config);
 	gc->config = cfg;
-	{
+	if (lock_changed) {
 		const double delay_ms = gc->config.buffering ? (double)gc->config.buffer_delay *
 								       (double)obs_get_frame_interval_ns() / 1000000.0
 							     : 0.0;
@@ -2476,6 +2554,31 @@ static void game_capture_update(void *data, obs_data_t *settings)
 		     "+%.0f ms), ring limit %" PRIu32 ", debug log: %s",
 		     gc->config.buffering ? "on" : "off", gc->config.buffer_delay, gc->config.buffer_delay == 1 ? "" : "s",
 		     delay_ms, delay_ms, gc->config.frame_ring, gc->config.frame_log ? "on" : "off");
+	}
+	if (ring_changed && gc->global_hook_info) {
+		/* hooked: ask the hook for the ring these settings need (it
+		 * re-creates its capture once, as when the ring grows); no
+		 * Buffering means the stock single texture */
+		uint32_t wanted = 1;
+
+		if (gc->config.buffering) {
+			const uint32_t least = ring_start_size(gc);
+
+			wanted = gc->ring_wanted > least ? gc->ring_wanted : least;
+			if (wanted > gc->config.frame_ring) {
+				wanted = gc->config.frame_ring;
+			}
+		}
+		if (wanted != gc->ring_wanted) {
+			info("frame ring: %" PRIu32 " slots asked of the hook for the new settings (was %" PRIu32
+			     "), the capture restarts once",
+			     wanted, gc->ring_wanted);
+			gc->ring_wanted = wanted;
+			gc->ring_need_ns = 0;
+			gc->ring_grow_ns = 0;
+			gc->global_hook_info->frame_ring_size = wanted;
+			reset_frame_interval(gc);
+		}
 	}
 	gc->retry_interval = DEFAULT_RETRY_INTERVAL * hook_rate_to_float(gc->config.hook_rate);
 	gc->wait_for_target_startup = false;
