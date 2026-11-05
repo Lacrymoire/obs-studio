@@ -217,9 +217,10 @@ struct game_capture_config {
 #define LOCK_BURST_MID_MAX 3 /* gaps between the two allowed in the window (jitter), more is a game speeding up */
 #define CADENCE_BURST_MAX_N 2
 /* Phase 6 cadence (see cadence_choose): m output ticks per n game frames */
-#define CADENCE_BAND 0.02      /* residual (paced tick rate / output rate - 1) a cadence may have to be chosen */
-#define CADENCE_KEEP 0.03      /* residual the current cadence may drift to before it is re-chosen */
+#define CADENCE_BAND 0.02      /* residual (paced tick rate / output rate - 1) a cadence for a fast game is chosen in */
+#define CADENCE_KEEP 0.03      /* residual a cadence may drift to before it is re-chosen */
 #define CADENCE_MAX_E 0.05     /* beyond this nothing is chosen: stock constant frame rate */
+#define CADENCE_FINE 0.0025    /* the same for a game slower than the output rate (planned repeats) */
 #define CADENCE_MAX_N 64       /* longest cycle in game frames */
 #define CADENCE_CHANGE_NS 2000000000ULL /* the rate must be outside the band this long before a change */
 
@@ -1614,17 +1615,27 @@ static inline uint32_t cadence_gcd(uint32_t a, uint32_t b)
 }
 
 /* r = output ticks per game frame (game period over tick interval).  For
- * n = 1, 2, ... the nearest m is tried; the first cadence whose residual is
- * within band wins (the shortest cycle: fewest, most evenly placed planned
- * repeats or skips), else the closest one within CADENCE_MAX_E.  false when
- * nothing fits. */
-static bool cadence_choose(double r, double band, uint32_t max_n, uint32_t *out_m, uint32_t *out_n, double *out_e)
+ * n = 1, 2, ... the nearest m is tried.  A whole- or half-frame cadence
+ * (n <= 2) within CADENCE_KEEP wins outright: no planned repeats at all, or
+ * the plain alternation of a 30 fps or 120 Hz game.  Otherwise the shortest
+ * cycle within the band wins, else the closest one within CADENCE_MAX_E.
+ * For a game slower than the output rate (r > 1: planned repeats) the band
+ * is CADENCE_FINE, so the pattern matches the game's rate: the planned
+ * repeats are the frames the game really did not make and the audio is left
+ * nearly alone.  Any m/n spreads its repeats as evenly as a whole number of
+ * ticks allows, so a longer cycle is no less even; the 2 % band of 0014 took
+ * 15/14 for a game at 56.9 fps (+1.8 %, a repeat every 15 ticks) where 19/18
+ * fits within 0.1 %.  A faster game (planned skips, which do not show) keeps
+ * CADENCE_BAND: its rate wanders more, and a short cycle holds through it.
+ * false when nothing fits. */
+static bool cadence_choose(double r, uint32_t max_n, uint32_t *out_m, uint32_t *out_n, double *out_e)
 {
 	uint32_t best_m = 0, best_n = 0;
 	double best_e = 1.0;
 
 	if (!(r > 0.0))
 		return false;
+	const double band = r > 1.0 ? CADENCE_FINE : CADENCE_BAND;
 	for (uint32_t n = 1; n <= max_n; n++) {
 		uint32_t m = (uint32_t)lround((double)n * r);
 		double e;
@@ -1649,8 +1660,9 @@ static bool cadence_choose(double r, double band, uint32_t max_n, uint32_t *out_
 			best_e = e;
 		}
 	}
-	if (!best_m || fabs(best_e) > CADENCE_MAX_E)
+	if (!best_m || fabs(best_e) > CADENCE_MAX_E) {
 		return false;
+	}
 	*out_m = best_m;
 	*out_n = best_n;
 	*out_e = best_e;
@@ -1709,7 +1721,7 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 					uint32_t m2, n2;
 					double e2;
 
-					if (cadence_choose(r, CADENCE_BAND, max_n, &m2, &n2, &e2)) {
+					if (cadence_choose(r, max_n, &m2, &n2, &e2)) {
 						const int dir = (double)m2 / (double)n2 > (double)m / (double)n ? 1 : -1;
 
 						info("game-clock output: cadence %" PRIu32 "/%" PRIu32 " -> %" PRIu32 "/%" PRIu32
@@ -1731,8 +1743,9 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 				gc->lock.cad_out_ns = 0;
 			}
 		} else {
-			if (!cadence_choose(r, CADENCE_BAND, max_n, &m, &n, &e))
+			if (!cadence_choose(r, max_n, &m, &n, &e)) {
 				m = n = 0;
+			}
 			gc->lock.cad_out_ns = 0;
 		}
 		if (!m && !gc->lock.fresh && !gc->lock.cad_refused) {
@@ -1799,8 +1812,8 @@ static bool lock_burst_cadence(const struct game_capture *gc)
 		return false;
 	if (gc->lock.cad_m && gc->lock.cad_n <= CADENCE_BURST_MAX_N)
 		return true;
-	return cadence_choose(gc->lock.period_ns / (double)obs_get_frame_interval_ns(), CADENCE_BAND,
-			      CADENCE_BURST_MAX_N, &m, &n, &e);
+	return cadence_choose(gc->lock.period_ns / (double)obs_get_frame_interval_ns(), CADENCE_BURST_MAX_N, &m, &n,
+			      &e);
 }
 
 static void ring_tick(struct game_capture *gc)
