@@ -1280,7 +1280,11 @@ static size_t mp4_write_stsd(struct mp4_mux *mux, struct mp4_track *track)
 	 * but in practice that doesn't appear to matter. */
 	uint8_t version = 0;
 
-	if (track->type == TRACK_AUDIO && mux->flavor != FLAVOR_MOV) {
+	/* AAC keeps the version 0 entry at any channel count (as FFmpeg
+	 * writes it): its esds carries the channel configuration, and VLC 3
+	 * and Windows Media Foundation read a version 1 entry the QuickTime
+	 * way, miss the esds and play a 5.1 recording without sound. */
+	if (track->type == TRACK_AUDIO && mux->flavor != FLAVOR_MOV && track->codec != CODEC_AAC) {
 		audio_t *audio = obs_encoder_audio(track->encoder);
 		version = audio_output_get_channels(audio) > 2 ? 1 : 0;
 	}
