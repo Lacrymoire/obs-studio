@@ -1986,6 +1986,7 @@ static void retime_reset(struct obs_encoder *encoder)
 	encoder->retime_v0 = 0.0;
 	encoder->retime_drift = 0.0;
 	encoder->retime_max_drift = 0.0;
+	encoder->retime_last_ts = 0;
 	encoder->retime_delta = 0;
 	encoder->retime_rate_n = 0;
 	encoder->retime_rate = 1.0;
@@ -2097,6 +2098,18 @@ static void retime_audio(struct obs_encoder *encoder, struct audio_data *audio)
 	 * encoder queues do not read as lag */
 	have_vtime = retime_file_time(venc, audio->timestamp, &vtime);
 	obs_encoder_release(venc);
+	/* the first chunk after a pause carries the time the pause began less
+	 * the whole pause (unpause_audio stamps it with ts_start, and
+	 * audio_pause_check then takes the new offset off): one pause length
+	 * too early.  After a pause of a few seconds that still lies within
+	 * the mark history, the video file time found there is the one from
+	 * before the pause, and the chunk read as a lag of the pause's length:
+	 * the trim swung by several percent and took seconds to settle.  A
+	 * chunk whose timestamp steps back is not measured; the trim stays */
+	if (have_vtime && encoder->retime_rs && audio->timestamp < encoder->retime_last_ts)
+		have_vtime = false;
+	else
+		encoder->retime_last_ts = audio->timestamp;
 	if (!have_vtime && !encoder->retime_rs)
 		return; /* no video frame yet: this chunk passes unchanged */
 

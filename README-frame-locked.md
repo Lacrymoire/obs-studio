@@ -60,8 +60,10 @@ game timeline, slightly delayed. On top of that:
 
 To record exactly as stock OBS does, close OBS and set `GameClockOutput=false`
 in `[Video]`, or turn Buffering off on the source. Both game-clock settings
-apply to every output, streaming included; streaming and the replay buffer have
-not been tested with them.
+apply to every output. **Set `GameClockOutput=false` before streaming**: the
+retimed file counts frames, not seconds, so a live stream would run short of
+data or build up delay whenever the game is not at exactly the canvas rate.
+The replay buffer has not been tested with them.
 
 ## Good to know
 
@@ -85,8 +87,31 @@ not been tested with them.
   stock hook: Vulkan/OpenGL games then load the stock hook, other games get
   this build's own copy, and Store games cannot be captured until this build
   is restarted.
-- Below about 57 fps on a 60 fps canvas (more than 5 % slow) no cadence fits
-  and the source records like the plain buffered mode.
+- A game slower than the canvas rate gets a pattern of planned repeats that
+  matches its rate (50 fps: 6 ticks per 5 frames, 55 fps: 12 per 11), and the
+  file keeps real-time speed. A game faster than the canvas rate that is not at
+  a whole multiple of it (116, 138 fps) gets the nearest short pattern, and the
+  file runs up to 3 % fast or slow, pitch included: cap such games at the
+  canvas rate or a whole multiple.
+- Shader mods: with "Capture third-party overlays" off, this build captures
+  the frame before anything that hooks the present call. ReShade installed as
+  a Vulkan layer, and ReShade or Special K injected globally, are then visible
+  on screen but missing from the video. Tick "Capture third-party overlays"
+  for those games (and hide the RTSS display yourself). Mods installed as a
+  DLL in the game folder (`dxgi.dll`, `d3d9.dll`) are recorded either way.
+- HDR: a game with a scRGB (16-bit float) swap chain is tone-mapped to the SDR
+  canvas automatically. A game with an HDR10 (10-bit PQ) swap chain looks
+  washed out unless the source's "RGB10A2 Color Space" is set to
+  "Rec. 2100 (PQ)", as in stock OBS.
+- Microsoft Store and Game Pass games: start this build once as administrator
+  so it can give `%ProgramData%\obs-studio-hook` the permission those games
+  need (stock OBS's installer does the same).
+- Updates: the package contains an empty `disable_updater.txt` next to
+  `portable_mode.txt`. Without it OBS offers the next stock release at start,
+  and "Update Now" would replace this build with stock OBS.
+- "Capture any fullscreen application" hooks whatever is fullscreen in front
+  when no game is captured, including a video player or a browser that is not
+  on OBS's skip list. Close them before a session or pick the game's window.
 
 ## Building
 

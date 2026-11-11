@@ -159,11 +159,15 @@ struct game_capture_config {
  * couple of ms early) skipped vblanks; the game's clock did not move.  Only
  * trusted while the ordinary presents sit on the line within that tolerance
  * (lock_note_err) and the gap is under LOCK_MISS_MAX_NS, and only while the
- * tolerance is under half the period: a faster clock (a menu at 1000 fps)
- * has no grid that can be read, every late present would land on it, and a
- * game dropping back to 130 fps would be kept on the menu's clock for good
- * (lock_grid_readable). */
+ * tolerance stays about a quarter of the period (LOCK_GRID_TOL_MAX): on a
+ * faster clock the LOCK_MISS_TOL_MIN_NS floor covers most of the period (58 %
+ * at 144 fps, 96 % at 240), nearly every present of a game that then runs
+ * slower lands "on the grid", and the lock kept a 150-250 fps menu's clock
+ * for many seconds, or for good (lock_grid_readable).  With the bound the
+ * floor may widen the tolerance by a twentieth: grids up to 131 fps, which
+ * keeps 120 Hz. */
 #define LOCK_MISS_TOL 0.25
+#define LOCK_GRID_TOL_MAX (LOCK_MISS_TOL * 1.05)
 #define LOCK_MISS_TOL_MIN_NS 2000000.0
 #define LOCK_MISS_MAX_NS 1000000000ULL
 #define LOCK_JITTER_N 32        /* window records before the jitter estimate is trusted */
@@ -256,6 +260,7 @@ struct game_capture {
 	bool showing;
 	bool active;
 	bool capturing;
+	bool memory_capture; /* the hook copies to system memory: no ring, the copy throttle stays */
 	bool activate_hook;
 	bool process_is_64bit;
 	bool error_acquiring;
@@ -667,11 +672,11 @@ static inline double lock_miss_tol(const struct game_capture *gc)
 }
 
 /* whether a present a whole number of periods late can be told from one off
- * the grid at all: not when the tolerance reaches half the period (a clock
- * above 250 fps with the 2 ms floor) */
+ * the grid: not when the 2 ms floor has widened the tolerance much beyond a
+ * quarter of the period (a clock above about 131 fps) */
 static inline bool lock_grid_readable(const struct game_capture *gc)
 {
-	return lock_miss_tol(gc) < 0.5 * gc->lock.period_ns;
+	return lock_miss_tol(gc) <= LOCK_GRID_TOL_MAX * gc->lock.period_ns;
 }
 
 /* where the ordinary presents sit against the line: a running mean of the
@@ -1433,6 +1438,8 @@ static void ring_free(struct game_capture *gc)
 
 /* called from init_shtex_capture inside obs_enter_graphics(); slot0 is the
  * texture it already opened from tex_handle (== tex_handles[0]) */
+static void game_clock_release(struct game_capture *gc);
+
 static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 {
 	const volatile struct shtex_data *shtex = gc->shtex_data;
@@ -1450,8 +1457,13 @@ static bool ring_open(struct game_capture *gc, gs_texture_t *slot0)
 		     gc->ring_wanted, hook_cap, hook_cap == 1 ? "" : "s");
 	}
 
-	if (n <= 1)
+	if (n <= 1) {
+		/* no ring any more (Buffering turned off, or the ring limit set
+		 * to 1, while capturing): ring_tick stops, so the game clock
+		 * must be let go here */
+		game_clock_release(gc);
 		return true;
+	}
 	if (n > FRAME_RING_MAX) {
 		warn("frame ring: hook reports %u slots, more than the %d this build supports", n, FRAME_RING_MAX);
 		return false;
@@ -1721,7 +1733,15 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 					uint32_t m2, n2;
 					double e2;
 
-					if (cadence_choose(r, max_n, &m2, &n2, &e2)) {
+					if (!cadence_choose(r, max_n, &m2, &n2, &e2)) {
+						m = n = 0;
+					} else if (m2 == m && n2 == n) {
+						/* still the best there is (frame generation
+						 * at a cap 3-5 % off a whole cadence, where
+						 * only n <= 2 is allowed): kept, and nothing
+						 * to log or to count as a change */
+						e = e2;
+					} else {
 						const int dir = (double)m2 / (double)n2 > (double)m / (double)n ? 1 : -1;
 
 						info("game-clock output: cadence %" PRIu32 "/%" PRIu32 " -> %" PRIu32 "/%" PRIu32
@@ -1734,8 +1754,6 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 						n = n2;
 						e = e2;
 						gc->lock.cad_changes++;
-					} else {
-						m = n = 0;
 					}
 					gc->lock.cad_out_ns = 0;
 				}
@@ -2298,6 +2316,7 @@ static void flog_tick(struct game_capture *gc)
 static void stop_capture(struct game_capture *gc)
 {
 	flog_close(gc, "capture stopped");
+	gc->memory_capture = false;
 
 	ipc_pipe_server_free(&gc->pipe);
 
@@ -2830,8 +2849,12 @@ static inline void reset_frame_interval(struct game_capture *gc)
 		/* Phase 8: with a frame ring every present is wanted: a game with
 		 * frame generation presents a rendered frame and its generated
 		 * frames within a couple of ms, and this throttle kept only the
-		 * first of them (the ring and the lock sort the rest out) */
-		if (gc->ring_wanted > 1)
+		 * first of them (the ring and the lock sort the rest out).
+		 * Not in memory capture (compatibility mode, or shared textures
+		 * not available): there is no ring there, and every present
+		 * would be read back to system memory for nothing */
+		if (gc->ring_wanted > 1 && !gc->memory_capture &&
+		    !(gc->global_hook_info && gc->global_hook_info->force_shmem))
 			interval = 0;
 	}
 
@@ -2869,7 +2892,6 @@ static inline bool init_hook_info(struct game_capture *gc)
 	gc->ring_need_ns = 0;
 	gc->ring_grow_ns = 0;
 	gc->global_hook_info->frame_ring_size = gc->ring_wanted;
-	reset_frame_interval(gc);
 
 	obs_enter_graphics();
 	if (!gs_shared_texture_available()) {
@@ -2877,6 +2899,10 @@ static inline bool init_hook_info(struct game_capture *gc)
 		gc->global_hook_info->force_shmem = true;
 	}
 	obs_leave_graphics();
+
+	/* after force_shmem is final: memory capture keeps the copy throttle */
+	gc->memory_capture = false;
+	reset_frame_interval(gc);
 
 	return true;
 }
@@ -3752,6 +3778,10 @@ static bool start_capture(struct game_capture *gc)
 		}
 
 		info("memory capture successful");
+		if (!gc->memory_capture) {
+			gc->memory_capture = true;
+			reset_frame_interval(gc);
+		}
 	} else {
 		if (!init_shtex_capture(gc)) {
 			return false;

@@ -180,10 +180,20 @@ static void vtable_front_check(struct vtable_front *f, IDXGISwapChain *swap)
 		return;
 	}
 	if (f->slot) {
-		if (entry != f->last_seen)
-			hlog("frame-lock: %s: %s replaced our entry in the swap chain's method table after the "
-			     "capture started; its overlay stays in the capture",
-			     f->name, hook_module_name(entry, m, sizeof(m)));
+		if (entry != f->last_seen) {
+			if (f->slot == &table[f->index])
+				hlog("frame-lock: %s: %s replaced our entry in the swap chain's method table after "
+				     "the capture started; its overlay stays in the capture",
+				     f->name, hook_module_name(entry, m, sizeof(m)));
+			else
+				/* one front per function: the table hooked first
+				 * keeps it (a game that changes its swap chain
+				 * class, as when frame generation is switched) */
+				hlog("frame-lock: %s: this swap chain has another method table than the one "
+				     "hooked in front, and %s runs before our hook there; its overlay stays in "
+				     "the capture until the game restarts",
+				     f->name, hook_module_name(entry, m, sizeof(m)));
+		}
 		f->last_seen = entry;
 		return;
 	}

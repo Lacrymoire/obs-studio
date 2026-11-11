@@ -1456,6 +1456,7 @@ struct obs_encoder {
 	double retime_v0;               /* video file time when the audio started */
 	double retime_drift;            /* filtered lag of the audio behind the video file time, s */
 	double retime_max_drift;
+	uint64_t retime_last_ts;        /* timestamp of the last audio chunk seen by the follower */
 	int retime_delta;               /* samples per second currently added (negative: removed) */
 	/* the rate of the video file time against real time, measured over the
 	 * last RETIME_RATE_HIST seconds (1 = real time; 0.9967 for a 59.8 fps
