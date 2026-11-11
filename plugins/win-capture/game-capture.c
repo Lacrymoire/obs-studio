@@ -221,11 +221,16 @@ struct game_capture_config {
 #define LOCK_BURST_MID_MAX 3 /* gaps between the two allowed in the window (jitter), more is a game speeding up */
 #define CADENCE_BURST_MAX_N 2
 /* Phase 6 cadence (see cadence_choose): m output ticks per n game frames */
-#define CADENCE_BAND 0.02      /* residual (paced tick rate / output rate - 1) a cadence for a fast game is chosen in */
-#define CADENCE_KEEP 0.03      /* residual a cadence may drift to before it is re-chosen */
+#define CADENCE_KEEP 0.03      /* residual (paced tick rate / output rate - 1) a cadence may drift to before it is re-chosen */
 #define CADENCE_MAX_E 0.05     /* beyond this nothing is chosen: stock constant frame rate */
-#define CADENCE_FINE 0.0025    /* the same for a game slower than the output rate (planned repeats) */
+#define CADENCE_FINE 0.0025    /* residual a cycle with planned repeats or uneven skips is chosen in */
 #define CADENCE_MAX_N 64       /* longest cycle in game frames */
+/* a game faster than the output (see cadence_choose): true speed unless a pattern fits closely */
+#define CADENCE_EVEN 0.01                       /* "every nth frame" (1/2, 1/3 ...) is chosen within this */
+#define CADENCE_EVEN_KEEP (1.5 * CADENCE_EVEN)  /* ... and held to this */
+#define CADENCE_FINE_KEEP (2.0 * CADENCE_FINE)  /* an exact cycle (2/3, 5/12) is held to this */
+#define CADENCE_FAST_MAX_N 12                   /* longest cycle for a fast game */
+#define CADENCE_TURN 0.02      /* with no pattern in force: a turn of the game's rate by this much is wander evidence */
 #define CADENCE_CHANGE_NS 2000000000ULL /* the rate must be outside the band this long before a change */
 
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
@@ -359,16 +364,17 @@ struct game_capture {
 		/* Phase 5 game-clock output (see game_clock_tick) */
 		bool vfr;                /* engaged: the game is the slower clock */
 		bool vfr_now;            /* this tick's frame carries a game-clock stamp */
-		bool cad_refused;        /* no cadence within CADENCE_MAX_E for this game (logged once) */
+		bool cad_refused;        /* no cadence fits this game's rate (logged once) */
 		bool ring_short_logged;  /* the ring cannot hold the buffer delay at this rate (logged once) */
 		uint64_t vfr_frames, vfr_paced, vfr_starved, vfr_repeats;
 		uint64_t vfr_fresh;      /* ticks run nominally while the fit was fresh (after a refit) */
 		/* Phase 6 cadence (see game_clock_tick): cad_m output ticks per cad_n game frames */
 		uint32_t cad_m, cad_n;
 		double cad_e;            /* its residual: paced tick rate / output rate - 1 */
-		uint64_t cad_out_ns;     /* since when the game's rate has been outside CADENCE_KEEP (0 = within) */
+		uint64_t cad_out_ns;     /* since when the game's rate has been outside the keep band (0 = within) */
 		uint64_t cad_changes;
 		int cad_dir;             /* direction of the last cadence change (+1 more ticks per frame, -1 fewer, 0 none) */
+		double cad_last_r;       /* ticks per game frame at the last change, or at the last turn while no cadence is in force */
 		uint64_t delay_ns;       /* buffer delay used this tick: the setting, or less when the ring is short */
 		/* Phase 6 grid slots (lock_add): the clock runs over slots, not
 		 * presents; a game on a vblank grid that misses a vblank has left a
@@ -1601,9 +1607,9 @@ static void ring_grow_check(struct game_capture *gc)
  * is shown twice, never once or three times) and clock jitter cannot flip it.
  * The next video tick is asked for at the time of the next lattice point plus
  * the buffer delay; the encoder stamps the frame with this tick's time.  The
- * paced tick rate is the game's rate times m/n, within CADENCE_BAND of the
- * output rate; in retimed mode the audio follows that residual (libobs,
- * patch 0012), in VFR mode the stamps carry it.
+ * paced tick rate is the game's rate times m/n, close to the output rate
+ * (the cadence's residual); in retimed mode the audio follows that residual
+ * (libobs, patch 0012), in VFR mode the stamps carry it.
  *   - while the game is stalled (this tick was starved) the nominal tick runs
  *     and the repeated frame is stamped with the tick time, so the stall is
  *     a run of ordinary repeats as in CFR.  Repeats are always encoded: the
@@ -1611,9 +1617,13 @@ static void ring_grow_check(struct game_capture *gc)
  *     holds the last B-frames until later frames arrive, so a tick without a
  *     frame would stall both for the length of a loading screen.
  *   - a game whose rate moves (an uncapped game, a 24 fps cutscene, a menu)
- *     drifts out of CADENCE_KEEP; after CADENCE_CHANGE_NS the cadence is
+ *     drifts out of the keep band; after CADENCE_CHANGE_NS the cadence is
  *     chosen again (logged).  A rate the lock cannot follow refits the clock
  *     (lock_reanchor burst) and the cadence re-engages on the new fit.
+ *   - a game faster than the output whose rate fits no pattern closely (a
+ *     driver cap at 116 or 117 fps on a 120 Hz screen, 138 on 144) gets no
+ *     cadence: the output keeps its own grid and the buffered frames are
+ *     chosen by the fitted clock, so the file runs at true speed and pitch.
  * Everything here is ignored by libobs unless game-clock output is enabled. */
 
 static inline uint32_t cadence_gcd(uint32_t a, uint32_t b)
@@ -1627,18 +1637,30 @@ static inline uint32_t cadence_gcd(uint32_t a, uint32_t b)
 }
 
 /* r = output ticks per game frame (game period over tick interval).  For
- * n = 1, 2, ... the nearest m is tried.  A whole- or half-frame cadence
- * (n <= 2) within CADENCE_KEEP wins outright: no planned repeats at all, or
- * the plain alternation of a 30 fps or 120 Hz game.  Otherwise the shortest
- * cycle within the band wins, else the closest one within CADENCE_MAX_E.
- * For a game slower than the output rate (r > 1: planned repeats) the band
- * is CADENCE_FINE, so the pattern matches the game's rate: the planned
- * repeats are the frames the game really did not make and the audio is left
- * nearly alone.  Any m/n spreads its repeats as evenly as a whole number of
- * ticks allows, so a longer cycle is no less even; the 2 % band of 0014 took
- * 15/14 for a game at 56.9 fps (+1.8 %, a repeat every 15 ticks) where 19/18
- * fits within 0.1 %.  A faster game (planned skips, which do not show) keeps
- * CADENCE_BAND: its rate wanders more, and a short cycle holds through it.
+ * n = 1, 2, ... the nearest m is tried.
+ *
+ * A game slower than the output (r > 1: planned repeats): a whole- or
+ * half-frame cadence (n <= 2) within CADENCE_KEEP wins outright (no uneven
+ * repeats at all: 1/1, or the plain doubling of a 30 fps game).  Otherwise
+ * the shortest cycle within CADENCE_FINE wins, else the closest one within
+ * CADENCE_MAX_E, so the pattern matches the game's rate: the planned repeats
+ * are the frames the game really did not make and the audio is left nearly
+ * alone.  Any m/n spreads its repeats as evenly as a whole number of ticks
+ * allows, so a longer cycle is no less even; the 2 % band of 0014 took 15/14
+ * for a game at 56.9 fps (+1.8 %, a repeat every 15 ticks) where 19/18 fits
+ * within 0.1 %.
+ *
+ * A game faster than the output (r < 1): frames are left out whatever is
+ * done, so a pattern is only worth what it costs in speed when it is exact.
+ * 1/1 keeps CADENCE_KEEP (every frame of a 61 fps game once).  "Every nth
+ * frame" (1/2 for 120 Hz vsync, 1/3, 1/4) is taken within CADENCE_EVEN, any
+ * other cycle up to CADENCE_FAST_MAX_N frames within CADENCE_FINE (2/3 for
+ * 90, 5/12 for 144).  Nothing else is chosen: a driver cap a few percent
+ * under the refresh rate (116 or 117 fps at 120 Hz) used to get 9/17 (file
+ * 2 % slow, a one-frame step seven times a second) or 1/2 (file 2.5 % fast)
+ * depending on the game, and the speed and pitch stepped whenever the cap
+ * came and went.  Without a cadence the output runs on its own grid at true
+ * speed and the frames are chosen by the fitted clock.
  * false when nothing fits. */
 static bool cadence_choose(double r, uint32_t max_n, uint32_t *out_m, uint32_t *out_n, double *out_e)
 {
@@ -1647,7 +1669,27 @@ static bool cadence_choose(double r, uint32_t max_n, uint32_t *out_m, uint32_t *
 
 	if (!(r > 0.0))
 		return false;
-	const double band = r > 1.0 ? CADENCE_FINE : CADENCE_BAND;
+	if (r < 1.0) {
+		if (max_n > CADENCE_FAST_MAX_N)
+			max_n = CADENCE_FAST_MAX_N;
+		for (uint32_t n = 1; n <= max_n; n++) {
+			uint32_t m = (uint32_t)lround((double)n * r);
+			double e;
+
+			if (m < 1)
+				m = 1;
+			if (cadence_gcd(m, n) != 1)
+				continue;
+			e = ((double)m / (double)n) / r - 1.0;
+			if (fabs(e) <= (n == 1 ? CADENCE_KEEP : m == 1 ? CADENCE_EVEN : CADENCE_FINE)) {
+				*out_m = m;
+				*out_n = n;
+				*out_e = e;
+				return true;
+			}
+		}
+		return false;
+	}
 	for (uint32_t n = 1; n <= max_n; n++) {
 		uint32_t m = (uint32_t)lround((double)n * r);
 		double e;
@@ -1660,7 +1702,7 @@ static bool cadence_choose(double r, uint32_t max_n, uint32_t *out_m, uint32_t *
 		/* a whole- or half-frame cadence (n <= 2) is the smoothest
 		 * pattern there is, so it is taken up to CADENCE_KEEP: the
 		 * band the lock would hold it in anyway */
-		if (fabs(e) <= (n <= 2 ? CADENCE_KEEP : band)) {
+		if (fabs(e) <= (n <= 2 ? CADENCE_KEEP : CADENCE_FINE)) {
 			best_m = m;
 			best_n = n;
 			best_e = e;
@@ -1679,6 +1721,16 @@ static bool cadence_choose(double r, uint32_t max_n, uint32_t *out_m, uint32_t *
 	*out_n = best_n;
 	*out_e = best_e;
 	return true;
+}
+
+/* how far a cadence in force may drift before it is chosen again: a fast
+ * game's pattern is held a little beyond the band it is chosen in, so a rate
+ * at the edge does not come and go */
+static inline double cadence_keep(uint32_t m, uint32_t n, double r)
+{
+	if (r < 1.0 && !(m == 1 && n == 1))
+		return m == 1 ? CADENCE_EVEN_KEEP : CADENCE_FINE_KEEP;
+	return CADENCE_KEEP;
 }
 
 /* the game-clock output stops following this source (no cadence any more, or
@@ -1722,7 +1774,7 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 			 * the ticks run nominally until the fit spans a second */
 		} else if (m) {
 			e = ((double)m / (double)n) / r - 1.0;
-			if (fabs(e) > CADENCE_KEEP) {
+			if (fabs(e) > cadence_keep(m, n, r)) {
 				/* outside the keep band the cadence is re-chosen after
 				 * CADENCE_CHANGE_NS (a rate wobbling about a boundary does
 				 * not hop); beyond CADENCE_MAX_E the tick rate is already
@@ -1734,6 +1786,14 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 					double e2;
 
 					if (!cadence_choose(r, max_n, &m2, &n2, &e2)) {
+						/* no pattern fits any more: the way the
+						 * rate left counts like a change */
+						const int dir = r > (double)m / (double)n ? 1 : -1;
+
+						if (gc->lock.cad_dir && dir != gc->lock.cad_dir)
+							lock_wander_event(gc, now);
+						gc->lock.cad_dir = dir;
+						gc->lock.cad_last_r = r;
 						m = n = 0;
 					} else if (m2 == m && n2 == n) {
 						/* still the best there is (frame generation
@@ -1750,6 +1810,7 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 						if (gc->lock.cad_dir && dir != gc->lock.cad_dir)
 							lock_wander_event(gc, now);
 						gc->lock.cad_dir = dir;
+						gc->lock.cad_last_r = r;
 						m = m2;
 						n = n2;
 						e = e2;
@@ -1761,15 +1822,47 @@ static void game_clock_tick(struct game_capture *gc, bool repeat)
 				gc->lock.cad_out_ns = 0;
 			}
 		} else {
-			if (!cadence_choose(r, max_n, &m, &n, &e)) {
+			if (cadence_choose(r, max_n, &m, &n, &e)) {
+				/* a pattern after none: which way the rate came */
+				if (gc->lock.cad_last_r > 0.0) {
+					const int dir = r > gc->lock.cad_last_r ? 1 : -1;
+
+					if (gc->lock.cad_dir && dir != gc->lock.cad_dir)
+						lock_wander_event(gc, now);
+					gc->lock.cad_dir = dir;
+				}
+				gc->lock.cad_last_r = r;
+			} else {
 				m = n = 0;
+				if (!(gc->lock.cad_last_r > 0.0)) {
+					gc->lock.cad_last_r = r;
+				} else {
+					/* no pattern in force: the rate's turning points
+					 * are followed, and a turn of CADENCE_TURN is
+					 * wander evidence like a cadence change that
+					 * reverses the last one (an uncapped game between
+					 * two patterns must still reach wander mode) */
+					const double mv = r / gc->lock.cad_last_r - 1.0;
+					const int dir = gc->lock.cad_dir;
+
+					if ((dir >= 0 && mv > 0.0) || (dir <= 0 && mv < 0.0)) {
+						if (dir || fabs(mv) > CADENCE_TURN) {
+							gc->lock.cad_dir = mv > 0.0 ? 1 : -1;
+							gc->lock.cad_last_r = r;
+						}
+					} else if (fabs(mv) > CADENCE_TURN) {
+						lock_wander_event(gc, now);
+						gc->lock.cad_dir = -dir;
+						gc->lock.cad_last_r = r;
+					}
+				}
 			}
 			gc->lock.cad_out_ns = 0;
 		}
 		if (!m && !gc->lock.fresh && !gc->lock.cad_refused) {
-			info("game-clock output: no cadence within %.0f %% for a game at %.2f fps; constant frame rate for "
-			     "this source",
-			     CADENCE_MAX_E * 100.0, 1e9 / gc->lock.period_ns);
+			info("game-clock output: no frame pattern fits a game at %.2f fps; the output keeps its own grid "
+			     "(true speed) for this source",
+			     1e9 / gc->lock.period_ns);
 			gc->lock.cad_refused = true;
 		} else if (m) {
 			gc->lock.cad_refused = false;

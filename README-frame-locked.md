@@ -26,7 +26,8 @@ game timeline, slightly delayed. On top of that:
   trimmed by the same amount and stays in sync.
 - **Every frame rate.** 30, 40, 60, 120, 144 fps and capped rates in between
   get a fixed cadence (for example every second frame of a 120 fps game on a
-  60 fps canvas). Uncapped games fall back to the plain buffered mode.
+  60 fps canvas). Uncapped games, and fast games whose rate fits no pattern,
+  fall back to the plain buffered mode at real-time speed.
 - **Frame generation.** DLSS multi-frame generation bursts are spread over the
   render interval and recorded in order.
 - **Every graphics API.** Direct3D 9, 10, 11, 12, OpenGL and Vulkan.
@@ -89,10 +90,15 @@ The replay buffer has not been tested with them.
   is restarted.
 - A game slower than the canvas rate gets a pattern of planned repeats that
   matches its rate (50 fps: 6 ticks per 5 frames, 55 fps: 12 per 11), and the
-  file keeps real-time speed. A game faster than the canvas rate that is not at
-  a whole multiple of it (116, 138 fps) gets the nearest short pattern, and the
-  file runs up to 3 % fast or slow, pitch included: cap such games at the
-  canvas rate or a whole multiple.
+  file keeps real-time speed. A game faster than the canvas rate gets a fixed
+  pattern only when one fits closely: every second, third or fourth frame
+  within 1 % (120 Hz V-Sync on a 60 fps canvas), or an exact cycle such as 90
+  or 144 fps. Any other fast rate (a driver limit at 116 or 117 fps on a
+  120 Hz screen, 138 on 144 Hz) is recorded in the plain buffered mode: the
+  file keeps real-time speed and pitch, and the frames are chosen by time, so
+  the step between two recorded frames is now and then one game frame shorter
+  than the others (four times a second at 116 fps). For a perfectly even
+  recording cap such games at the canvas rate or a whole multiple of it.
 - Shader mods: with "Capture third-party overlays" off, this build captures
   the frame before anything that hooks the present call. ReShade installed as
   a Vulkan layer, and ReShade or Special K injected globally, are then visible
